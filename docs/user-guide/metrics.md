@@ -18,6 +18,11 @@ The following metrics are available, excluding the default Prometheus metrics:
 | `fireactions_pool_scale_requests_total`      | Counter   | Number of scale API requests for a pool                   | `pool`                                           |
 | `fireactions_scale_operations_total`         | Counter   | Total number of individual scale operations               | `pool`, `organization`, `direction`, `status`    |
 | `fireactions_scale_duration_seconds`         | Histogram | Time taken to complete a scale operation                  | `pool`, `organization`, `direction`              |
+| `fireactions_capacity_memory_limit_mib`      | Gauge     | Configured global guest memory limit in MiB               | None                                             |
+| `fireactions_capacity_memory_reserved_mib`   | Gauge     | Reserved global guest memory in MiB                       | None                                             |
+| `fireactions_capacity_vcpu_limit`            | Gauge     | Configured global guest vCPU limit                        | None                                             |
+| `fireactions_capacity_vcpu_reserved`         | Gauge     | Reserved global guest vCPU capacity                       | None                                             |
+| `fireactions_capacity_admission_blocks_total`| Counter   | VM admissions blocked by global capacity                  | `pool`, `organization`, `resource`               |
 
 
 Example Grafana dashboard for vizualisation of Fireactions metrics:

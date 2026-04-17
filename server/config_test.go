@@ -4,13 +4,99 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewConfig(t *testing.T) {
 	config, err := NewConfig("testdata/config1.yaml")
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
+	require.NoError(t, err)
 
 	assert.Equal(t, "testdata/config1.yaml", config.path)
+}
+
+func TestConfigValidateCapacityDefaults(t *testing.T) {
+	config := minimalValidConfig()
+
+	require.NoError(t, config.Validate())
+	require.NotNil(t, config.Capacity)
+	assert.Equal(t, int64(0), config.Capacity.MemoryLimitMib)
+	assert.Equal(t, int64(0), config.Capacity.VCPULimit)
+}
+
+func TestConfigValidateRejectsNegativeCapacity(t *testing.T) {
+	config := minimalValidConfig()
+	config.Capacity = &CapacityConfig{
+		MemoryLimitMib: -1,
+		VCPULimit:      -1,
+	}
+
+	err := config.Validate()
+	require.Error(t, err)
+}
+
+func TestConfigValidateRejectsInvalidMachineShape(t *testing.T) {
+	config := minimalValidConfig()
+	config.Pools[0].Firecracker.MachineConfig.MemSizeMib = 0
+
+	err := config.Validate()
+	require.Error(t, err)
+
+	config = minimalValidConfig()
+	config.Pools[0].Firecracker.MachineConfig.VcpuCount = 0
+
+	err = config.Validate()
+	require.Error(t, err)
+}
+
+func TestConfigValidateRejectsPoolLargerThanGlobalCapacity(t *testing.T) {
+	config := minimalValidConfig()
+	config.Capacity = &CapacityConfig{
+		MemoryLimitMib: 1024,
+		VCPULimit:      1,
+	}
+
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds capacity")
+}
+
+func TestConfigValidateRejectsNilPoolEntry(t *testing.T) {
+	config := minimalValidConfig()
+	config.Pools = []*PoolConfig{nil}
+
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pool at index 0 is required")
+}
+
+func minimalValidConfig() *Config {
+	config := DefaultConfig()
+	config.BindAddress = "127.0.0.1:8080"
+	config.GitHub = &GitHubConfig{
+		AppPrivateKey: "private-key",
+		AppID:         1,
+	}
+	config.LogLevel = "info"
+	config.Pools = []*PoolConfig{{
+		Name:           "default",
+		ShutdownOnExit: boolPtr(true),
+		Replicas:       1,
+		Runner: &RunnerConfig{
+			Name:            "runner",
+			ImagePullPolicy: "IfNotPresent",
+			Image:           "ghcr.io/example/fireactions:test",
+			Organization:    "example",
+			GroupID:         1,
+			Labels:          []string{"self-hosted"},
+		},
+		Firecracker: &FirecrackerConfig{
+			KernelImagePath: "/var/lib/fireactions/vmlinux",
+			MachineConfig: FirecrackerMachineConfig{
+				MemSizeMib: 2048,
+				VcpuCount:  2,
+			},
+		},
+	}}
+
+	return config
 }

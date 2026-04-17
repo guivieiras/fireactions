@@ -389,6 +389,11 @@ Create `/etc/fireactions/config.yaml` with your specific values:
 # Address where Fireactions will listen (change to 0.0.0.0:8080 for external access)
 bind_address: 127.0.0.1:8080
 
+# Optional global host capacity limits across all pools
+capacity:
+  memory_limit_mib: 12288
+  vcpu_limit: 8
+
 # Prometheus metrics endpoint
 metrics:
   enabled: true

@@ -16,6 +16,21 @@ Example configuration file with all available options:
 bind_address: 0.0.0.0:8080
 
 #
+# Global host capacity limits across all pools.
+#
+capacity:
+  #
+  # Maximum total guest memory Fireactions may reserve across all running and in-flight VMs.
+  # 0 disables the limit.
+  #
+  memory_limit_mib: 12288
+  #
+  # Maximum total guest vCPUs Fireactions may reserve across all running and in-flight VMs.
+  # 0 disables the limit.
+  #
+  vcpu_limit: 8
+
+#
 # Metrics server configuration. This is used to expose Prometheus metrics on endpoint `/metrics`.
 #
 metrics:

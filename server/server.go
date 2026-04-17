@@ -30,6 +30,7 @@ type Server struct {
 	github        *github.Client
 	containerd    *containerd.Client
 	imageManager  *imageManager
+	capacity      *CapacityManager
 	l             *sync.Mutex
 	logger        *zerolog.Logger
 	nextCID       atomic.Uint32 // Global VSOCK CID counter (starts at 3)
@@ -82,6 +83,7 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 		pools:      make(map[string]*Pool),
 		github:     github,
 		containerd: containerdClient,
+		capacity:   NewCapacityManager(config.Capacity),
 		l:          &sync.Mutex{},
 		logger:     &logger,
 		version:    fireactions.Version,
@@ -133,8 +135,18 @@ func (s *Server) Run(ctx context.Context) error {
 		_ = listener.Close()
 	}()
 
+	if s.capacity.Enabled() {
+		snapshot := s.capacity.Snapshot()
+		s.logger.Info().
+			Int64("memory_limit_mib", snapshot.MemoryLimitMib).
+			Int64("vcpu_limit", snapshot.VCPULimit).
+			Msg("Global capacity limiter enabled")
+	} else {
+		s.logger.Info().Msg("Global capacity limiter disabled")
+	}
+
 	for _, poolConfig := range s.config.Pools {
-		pool, err := NewPool(s.logger, poolConfig, s.github, s.imageManager, s.containerd, &s.nextCID)
+		pool, err := NewPool(s.logger, poolConfig, s.github, s.imageManager, s.containerd, &s.nextCID, s.capacity)
 		if err != nil {
 			return fmt.Errorf("creating pool: %w", err)
 		}
@@ -166,6 +178,15 @@ func (s *Server) Run(ctx context.Context) error {
 			s.logger.Info().Msgf("Stopping pool %s", name)
 			pool.Stop()
 			s.logger.Info().Msgf("Pool %s stopped", name)
+		}
+
+		snapshot := s.capacity.Snapshot()
+		if snapshot.Outstanding > 0 {
+			s.logger.Warn().
+				Int("outstanding_reservations", snapshot.Outstanding).
+				Int64("reserved_memory_mib", snapshot.MemoryReservedMib).
+				Int64("reserved_vcpu", snapshot.VCPUReserved).
+				Msg("Outstanding global capacity reservations remain during shutdown")
 		}
 
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

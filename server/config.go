@@ -11,6 +11,7 @@ import (
 // Config is the configuration for the Client.
 type Config struct {
 	BindAddress      string            `yaml:"bind_address" validate:"required,hostname_port"`
+	Capacity         *CapacityConfig   `yaml:"capacity"`
 	Containerd       *ContainerdConfig `yaml:"containerd" validate:"required"`
 	Metrics          *MetricsConfig    `yaml:"metrics"`
 	BasicAuthEnabled bool              `yaml:"basic_auth_enabled" validate:""`
@@ -20,6 +21,11 @@ type Config struct {
 	LogLevel         string            `yaml:"log_level" validate:"required,oneof=debug info warn error fatal panic trace"`
 
 	path string
+}
+
+type CapacityConfig struct {
+	MemoryLimitMib int64 `yaml:"memory_limit_mib" validate:"min=0"`
+	VCPULimit      int64 `yaml:"vcpu_limit" validate:"min=0"`
 }
 
 type ContainerdConfig struct {
@@ -55,14 +61,15 @@ type FirecrackerConfig struct {
 }
 
 type FirecrackerMachineConfig struct {
-	VcpuCount  int64 `yaml:"vcpu_count"`
-	MemSizeMib int64 `yaml:"mem_size_mib"`
+	VcpuCount  int64 `yaml:"vcpu_count" validate:"min=1"`
+	MemSizeMib int64 `yaml:"mem_size_mib" validate:"min=1"`
 }
 
 // DefaultConfig creates a new Config with default values.
 func DefaultConfig() *Config {
 	c := &Config{
 		BindAddress:      ":8080",
+		Capacity:         &CapacityConfig{},
 		Containerd:       &ContainerdConfig{Address: "/run/containerd/containerd.sock", Namespace: "fireactions"},
 		Metrics:          &MetricsConfig{Enabled: true, Address: ":8081"},
 		BasicAuthEnabled: false,
@@ -109,5 +116,41 @@ func (c *Config) Load() error {
 
 // Validate validates the configuration.
 func (c *Config) Validate() error {
-	return validator.New().Struct(c)
+	if c.Capacity == nil {
+		c.Capacity = &CapacityConfig{}
+	}
+
+	if err := validator.New().Struct(c); err != nil {
+		return err
+	}
+
+	for i, pool := range c.Pools {
+		if pool == nil {
+			return fmt.Errorf("pool at index %d is required", i)
+		}
+
+		if pool.Firecracker == nil {
+			return fmt.Errorf("pool %q firecracker config is required", pool.Name)
+		}
+
+		if pool.Firecracker.MachineConfig.MemSizeMib < 1 {
+			return fmt.Errorf("pool %q mem_size_mib must be at least 1", pool.Name)
+		}
+
+		if pool.Firecracker.MachineConfig.VcpuCount < 1 {
+			return fmt.Errorf("pool %q vcpu_count must be at least 1", pool.Name)
+		}
+
+		if c.Capacity.MemoryLimitMib > 0 && pool.Firecracker.MachineConfig.MemSizeMib > c.Capacity.MemoryLimitMib {
+			return fmt.Errorf("pool %q mem_size_mib %d exceeds capacity.memory_limit_mib %d",
+				pool.Name, pool.Firecracker.MachineConfig.MemSizeMib, c.Capacity.MemoryLimitMib)
+		}
+
+		if c.Capacity.VCPULimit > 0 && pool.Firecracker.MachineConfig.VcpuCount > c.Capacity.VCPULimit {
+			return fmt.Errorf("pool %q vcpu_count %d exceeds capacity.vcpu_limit %d",
+				pool.Name, pool.Firecracker.MachineConfig.VcpuCount, c.Capacity.VCPULimit)
+		}
+	}
+
+	return nil
 }

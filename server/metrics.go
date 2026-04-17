@@ -64,4 +64,34 @@ var (
 		Namespace: namespace,
 		Help:      "Status of a pool. 0 is paused, 1 is active.",
 	}, []string{"pool"})
+
+	metricCapacityMemoryLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Name:      "capacity_memory_limit_mib",
+		Namespace: namespace,
+		Help:      "Configured global guest memory capacity limit in MiB. 0 means disabled.",
+	})
+
+	metricCapacityMemoryReserved = promauto.NewGauge(prometheus.GaugeOpts{
+		Name:      "capacity_memory_reserved_mib",
+		Namespace: namespace,
+		Help:      "Currently reserved global guest memory capacity in MiB.",
+	})
+
+	metricCapacityVCPULimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Name:      "capacity_vcpu_limit",
+		Namespace: namespace,
+		Help:      "Configured global guest vCPU capacity limit. 0 means disabled.",
+	})
+
+	metricCapacityVCPUReserved = promauto.NewGauge(prometheus.GaugeOpts{
+		Name:      "capacity_vcpu_reserved",
+		Namespace: namespace,
+		Help:      "Currently reserved global guest vCPU capacity.",
+	})
+
+	metricCapacityAdmissionBlocks = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name:      "capacity_admission_blocks_total",
+		Namespace: namespace,
+		Help:      "Number of VM admissions blocked by global capacity limits.",
+	}, []string{"pool", "organization", "resource"})
 )

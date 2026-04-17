@@ -34,26 +34,30 @@ const (
 
 // Pool represents a pool of Firecracker VMs that are used to run GitHub Actions jobs.
 type Pool struct {
-	config         *PoolConfig
-	containerd     *containerd.Client
-	github         *github.Client
-	imageManager   *imageManager
-	pendingCreates atomic.Int32
-	pendingDeletes atomic.Int32
-	machinesMu     *sync.Mutex
-	machines       map[string]*Machine
-	installationID atomic.Int64
-	logger         *zerolog.Logger
-	replicas       atomic.Int32
-	isActive       bool
-	scaleTrigger   chan struct{}
-	stopCh         chan struct{}
-	doneCh         chan struct{}
-	cleanupWg      sync.WaitGroup
-	ctx            context.Context
-	cancel         context.CancelFunc
-	nextCID        *atomic.Uint32
-	l              *sync.Mutex
+	config                *PoolConfig
+	containerd            *containerd.Client
+	github                *github.Client
+	imageManager          *imageManager
+	capacity              *CapacityManager
+	pendingCreates        atomic.Int32
+	pendingDeletes        atomic.Int32
+	machinesMu            *sync.Mutex
+	machines              map[string]*Machine
+	installationID        atomic.Int64
+	logger                *zerolog.Logger
+	replicas              atomic.Int32
+	isActive              bool
+	scaleTrigger          chan struct{}
+	stopCh                chan struct{}
+	doneCh                chan struct{}
+	cleanupWg             sync.WaitGroup
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	nextCID               *atomic.Uint32
+	l                     *sync.Mutex
+	capacityBlockedReason CapacityBlockReason
+	createMachineFn       func(context.Context, *CapacityReservation) error
+	shutdownWaitTimeout   time.Duration
 }
 
 // PoolConfig represents the configuration of a Pool.
@@ -81,27 +85,33 @@ func (p *PoolConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 // NewPool creates a new Pool.
-func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, imageManager *imageManager, containerdClient *containerd.Client, nextCID *atomic.Uint32) (*Pool, error) {
+func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, imageManager *imageManager, containerdClient *containerd.Client, nextCID *atomic.Uint32, capacity *CapacityManager) (*Pool, error) {
 	l := logger.With().Str("pool", config.Name).Logger()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	if capacity == nil {
+		capacity = NewCapacityManager(nil)
+	}
+
 	p := &Pool{
-		config:       config,
-		l:            &sync.Mutex{},
-		machinesMu:   &sync.Mutex{},
-		machines:     make(map[string]*Machine),
-		isActive:     true,
-		containerd:   containerdClient,
-		github:       github,
-		imageManager: imageManager,
-		logger:       &l,
-		scaleTrigger: make(chan struct{}, 1),
-		stopCh:       make(chan struct{}, 1),
-		doneCh:       make(chan struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
-		nextCID:      nextCID,
+		config:              config,
+		l:                   &sync.Mutex{},
+		machinesMu:          &sync.Mutex{},
+		machines:            make(map[string]*Machine),
+		isActive:            true,
+		containerd:          containerdClient,
+		github:              github,
+		imageManager:        imageManager,
+		capacity:            capacity,
+		logger:              &l,
+		scaleTrigger:        make(chan struct{}, 1),
+		stopCh:              make(chan struct{}, 1),
+		doneCh:              make(chan struct{}),
+		ctx:                 ctx,
+		cancel:              cancel,
+		nextCID:             nextCID,
+		shutdownWaitTimeout: 30 * time.Second,
 	}
 
 	p.replicas.Store(int32(config.Replicas))
@@ -209,9 +219,9 @@ func (p *Pool) Stop() {
 
 	// Stop all machines - cleanup goroutines will handle the rest
 	for _, machine := range machines {
-		runnerName := machine.Cfg.VMID
+		runnerName := machine.Name
 
-		err := machine.StopVMM()
+		err := machine.Stop()
 		if err != nil {
 			p.logger.Error().Err(err).Msgf("Failed to stop Firecracker VM %s", runnerName)
 		}
@@ -254,18 +264,22 @@ func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
 	pendingCreates := int(p.pendingCreates.Load())
 	pendingDeletes := int(p.pendingDeletes.Load())
 
-	// Calculate effective size accounting for in-flight operations
-	effectiveSize := curSize + pendingCreates - pendingDeletes
+	// GetCurrentSize excludes draining machines, so pendingDeletes must not be
+	// subtracted here or the same in-flight delete will be counted twice.
+	effectiveSize := curSize + pendingCreates
 	delta := desiredReplicas - effectiveSize
 
 	if delta == 0 {
+		p.clearCapacityBlocked(false)
 		return nil
 	}
 
 	if delta > 0 {
-		p.scaleUp(
+		result := p.scaleUp(
 			ctx, delta, desiredReplicas, curSize, pendingCreates, pendingDeletes)
+		p.updateCapacityBlockedState(result, desiredReplicas, curSize)
 	} else {
+		p.clearCapacityBlocked(false)
 		p.scaleDown(
 			ctx, -delta, desiredReplicas, curSize, pendingCreates, pendingDeletes)
 	}
@@ -273,24 +287,49 @@ func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
 	return nil
 }
 
-func (p *Pool) scaleUp(ctx context.Context, count, desiredReplicas, curSize, pendingCreates, pendingRemovals int) {
+type scaleUpResult struct {
+	granted int
+	blocked int
+	reason  CapacityBlockReason
+}
+
+func (p *Pool) scaleUp(ctx context.Context, count, desiredReplicas, curSize, pendingCreates, pendingRemovals int) scaleUpResult {
 	p.logger.Debug().Msgf("Scaling up by %d VMs (target: %d, current: %d, pending creates: %d, pending removals: %d)",
 		count, desiredReplicas, curSize, pendingCreates, pendingRemovals)
 
-	for i := 0; i < count; i++ {
+	memPerVM := p.config.Firecracker.MachineConfig.MemSizeMib
+	vcpuPerVM := p.config.Firecracker.MachineConfig.VcpuCount
+	reservations, reason := p.capacity.ReserveUpTo(count, memPerVM, vcpuPerVM)
+	blocked := count - len(reservations)
+
+	if blocked > 0 {
+		metricScaleOperations.WithLabelValues(p.config.Name, p.config.Runner.Organization, "up", "blocked").Add(float64(blocked))
+		switch reason {
+		case CapacityBlockReasonMemory:
+			metricCapacityAdmissionBlocks.WithLabelValues(p.config.Name, p.config.Runner.Organization, "memory").Add(float64(blocked))
+		case CapacityBlockReasonVCPU:
+			metricCapacityAdmissionBlocks.WithLabelValues(p.config.Name, p.config.Runner.Organization, "vcpu").Add(float64(blocked))
+		case CapacityBlockReasonBoth:
+			metricCapacityAdmissionBlocks.WithLabelValues(p.config.Name, p.config.Runner.Organization, "memory").Add(float64(blocked))
+			metricCapacityAdmissionBlocks.WithLabelValues(p.config.Name, p.config.Runner.Organization, "vcpu").Add(float64(blocked))
+		}
+	}
+
+	for _, reservation := range reservations {
 		p.pendingCreates.Add(1)
 
-		go func() {
+		go func(reservation *CapacityReservation) {
 			defer p.pendingCreates.Add(-1)
 
 			select {
 			case <-p.ctx.Done():
+				reservation.Release()
 				return
 			default:
 			}
 
 			start := time.Now()
-			if err := p.createMachine(ctx); err != nil {
+			if err := p.runCreateMachine(ctx, reservation); err != nil {
 				metricScaleOperations.WithLabelValues(p.config.Name, p.config.Runner.Organization, "up", "failure").Inc()
 				p.logger.Error().Err(err).Msg("Failed to create machine")
 				return
@@ -299,7 +338,13 @@ func (p *Pool) scaleUp(ctx context.Context, count, desiredReplicas, curSize, pen
 			duration := time.Since(start).Seconds()
 			metricScaleOperations.WithLabelValues(p.config.Name, p.config.Runner.Organization, "up", "success").Inc()
 			metricScaleDuration.WithLabelValues(p.config.Name, p.config.Runner.Organization, "up").Observe(duration)
-		}()
+		}(reservation)
+	}
+
+	return scaleUpResult{
+		granted: len(reservations),
+		blocked: blocked,
+		reason:  reason,
 	}
 }
 
@@ -312,9 +357,14 @@ func (p *Pool) scaleDown(ctx context.Context, count, desiredReplicas, curSize, p
 		count, desiredReplicas, curSize, pendingCreates, pendingDeletes)
 
 	for i := 0; i < count; i++ {
+		targetMachine, targetName, ok := p.beginDeleteMachine()
+		if !ok {
+			return
+		}
+
 		p.pendingDeletes.Add(1)
 
-		go func() {
+		go func(targetMachine *Machine, targetName string) {
 			defer p.pendingDeletes.Add(-1)
 
 			select {
@@ -324,7 +374,7 @@ func (p *Pool) scaleDown(ctx context.Context, count, desiredReplicas, curSize, p
 			}
 
 			start := time.Now()
-			if err := p.deleteMachine(ctx); err != nil {
+			if err := p.stopSelectedMachine(targetMachine, targetName); err != nil {
 				metricScaleOperations.WithLabelValues(p.config.Name, p.config.Runner.Organization, "down", "failure").Inc()
 				p.logger.Error().Err(err).Msg("Failed to delete machine")
 				return
@@ -333,8 +383,55 @@ func (p *Pool) scaleDown(ctx context.Context, count, desiredReplicas, curSize, p
 			duration := time.Since(start).Seconds()
 			metricScaleOperations.WithLabelValues(p.config.Name, p.config.Runner.Organization, "down", "success").Inc()
 			metricScaleDuration.WithLabelValues(p.config.Name, p.config.Runner.Organization, "down").Observe(duration)
-		}()
+		}(targetMachine, targetName)
 	}
+}
+
+func (p *Pool) updateCapacityBlockedState(result scaleUpResult, desiredReplicas, curSize int) {
+	if result.blocked == 0 {
+		p.clearCapacityBlocked(true)
+		return
+	}
+
+	if p.capacityBlockedReason == result.reason {
+		return
+	}
+
+	p.capacityBlockedReason = result.reason
+	snapshot := p.capacity.Snapshot()
+
+	p.logger.Warn().
+		Int("desired_replicas", desiredReplicas).
+		Int("current_replicas", curSize).
+		Int64("vm_mem_size_mib", p.config.Firecracker.MachineConfig.MemSizeMib).
+		Int64("vm_vcpu_count", p.config.Firecracker.MachineConfig.VcpuCount).
+		Int("granted", result.granted).
+		Int("blocked", result.blocked).
+		Int64("reserved_memory_mib", snapshot.MemoryReservedMib).
+		Int64("memory_limit_mib", snapshot.MemoryLimitMib).
+		Int64("reserved_vcpu", snapshot.VCPUReserved).
+		Int64("vcpu_limit", snapshot.VCPULimit).
+		Str("blocked_by", string(result.reason)).
+		Msg("Global capacity blocked VM admission")
+}
+
+func (p *Pool) clearCapacityBlocked(logResume bool) {
+	if p.capacityBlockedReason == CapacityBlockReasonNone {
+		return
+	}
+
+	previous := p.capacityBlockedReason
+	p.capacityBlockedReason = CapacityBlockReasonNone
+	if !logResume {
+		return
+	}
+
+	snapshot := p.capacity.Snapshot()
+	p.logger.Info().
+		Str("previous_blocked_by", string(previous)).
+		Int64("reserved_memory_mib", snapshot.MemoryReservedMib).
+		Int64("reserved_vcpu", snapshot.VCPUReserved).
+		Msg("Global capacity admission resumed")
 }
 
 // Pause pauses the pool. Pausing the pool will prevent the pool from scaling.
@@ -380,7 +477,18 @@ func (p *Pool) GetReplicas() int {
 func (p *Pool) GetCurrentSize() int {
 	p.machinesMu.Lock()
 	defer p.machinesMu.Unlock()
-	return len(p.machines)
+
+	size := 0
+	for _, machine := range p.machines {
+		// Machines marked as stopping are already draining out of the pool and
+		// should not contribute to the effective pool size during reconciliation.
+		if machine.stopping {
+			continue
+		}
+		size++
+	}
+
+	return size
 }
 
 func (p *Pool) ListMachines(ctx context.Context) ([]*Machine, error) {
@@ -407,7 +515,15 @@ func (p *Pool) GetMachine(name string) (*Machine, error) {
 	return machine, nil
 }
 
-func (p *Pool) createMachine(ctx context.Context) error {
+func (p *Pool) runCreateMachine(ctx context.Context, reservation *CapacityReservation) error {
+	if p.createMachineFn != nil {
+		return p.createMachineFn(ctx, reservation)
+	}
+
+	return p.createMachine(ctx, reservation)
+}
+
+func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservation) error {
 	image, err := p.imageManager.ensureImage(
 		ctx,
 		p.config.Runner.Image,
@@ -429,6 +545,9 @@ func (p *Pool) createMachine(ctx context.Context) error {
 	var machineCreated bool
 	defer func() {
 		if !machineCreated {
+			if reservation != nil {
+				reservation.Release()
+			}
 			// Clean up lease if machine creation failed
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cleanupCancel()
@@ -539,6 +658,9 @@ func (p *Pool) createMachine(ctx context.Context) error {
 		RunnerID:    jitConfig.GetRunner().GetID(),
 		Pool:        p.config.Name,
 		CreatedAt:   time.Now().UTC(),
+		MemoryMib:   p.config.Firecracker.MachineConfig.MemSizeMib,
+		VCPUCount:   p.config.Firecracker.MachineConfig.VcpuCount,
+		Reservation: reservation,
 		vsockCID:    vsockCID,
 		vsockPath:   vsockPath,
 		leaseCancel: leaseCtxCancel,
@@ -546,80 +668,109 @@ func (p *Pool) createMachine(ctx context.Context) error {
 		vmmCancel:   vmmCancel,
 	}
 
+	p.trackMachine(machine)
+
+	return nil
+}
+
+func (p *Pool) trackMachine(machine *Machine) {
 	p.machinesMu.Lock()
-	p.machines[runnerName] = machine
+	p.machines[machine.Name] = machine
 	p.machinesMu.Unlock()
 
-	// Start cleanup goroutine
 	p.cleanupWg.Add(1)
 	go func() {
 		defer p.cleanupWg.Done()
 
 		waitDone := make(chan error, 1)
 		go func() {
-			waitDone <- machine.Wait(context.Background())
+			waitDone <- machine.WaitForExit(context.Background())
 		}()
 
 		select {
 		case <-waitDone:
-			// Machine exited normally
 		case <-p.ctx.Done():
-			// Pool is stopping, wait up to 30s for machine to fully exit
 			select {
 			case <-waitDone:
-			case <-time.After(30 * time.Second):
-				p.logger.Warn().Msgf("Timeout waiting for machine %s to exit during pool shutdown", runnerName)
+			case <-time.After(p.shutdownWaitTimeout):
+				p.logger.Warn().Msgf("Timeout waiting for machine %s to exit during pool shutdown", machine.Name)
 			}
 		}
 
 		p.machinesMu.Lock()
-		_, exists := p.machines[runnerName]
-		if exists {
-			delete(p.machines, runnerName)
+		current, exists := p.machines[machine.Name]
+		if exists && current == machine {
+			delete(p.machines, machine.Name)
 		}
 		p.machinesMu.Unlock()
 
-		machine.vmmCancel()
-
-		p.deleteGitHubRunner(runnerName, machine.RunnerID)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		err := machine.leaseCancel(ctx)
-		if err != nil && !errdefs.IsNotFound(err) {
-			p.logger.Error().Err(err).Msgf("Failed to remove Containerd lease for Firecracker VM %s", runnerName)
+		if machine.Reservation != nil {
+			machine.Reservation.Release()
 		}
 
-		p.logger.Info().Msgf("Successfully cleaned up exited Firecracker VM %s", runnerName)
-	}()
+		if machine.vmmCancel != nil {
+			machine.vmmCancel()
+		}
 
-	return nil
+		p.deleteGitHubRunner(machine.Name, machine.RunnerID)
+
+		if machine.leaseCancel != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := machine.leaseCancel(ctx)
+			if err != nil && !errdefs.IsNotFound(err) {
+				p.logger.Error().Err(err).Msgf("Failed to remove Containerd lease for Firecracker VM %s", machine.Name)
+			}
+		}
+
+		p.logger.Info().Msgf("Successfully cleaned up exited Firecracker VM %s", machine.Name)
+	}()
 }
 
-// removeMachine removes a single machine from the pool.
-func (p *Pool) deleteMachine(_ context.Context) error {
+func (p *Pool) beginDeleteMachine() (*Machine, string, bool) {
 	p.machinesMu.Lock()
+	defer p.machinesMu.Unlock()
 
-	// Find a machine to remove (pick the first one)
+	// Find a machine to remove (pick the first non-stopping one)
 	var targetMachine *Machine
 	var targetName string
 	for name, machine := range p.machines {
+		if machine.stopping {
+			continue
+		}
+
+		machine.stopping = true
 		targetMachine = machine
 		targetName = name
 		break
 	}
 
 	if targetMachine == nil {
-		p.machinesMu.Unlock()
+		return nil, "", false
+	}
+
+	return targetMachine, targetName, true
+}
+
+// removeMachine removes a single machine from the pool.
+func (p *Pool) deleteMachine(_ context.Context) error {
+	targetMachine, targetName, ok := p.beginDeleteMachine()
+	if !ok {
 		return fmt.Errorf("no machines available to scale down")
 	}
 
-	// Remove from map immediately to prevent selecting the same machine multiple times
-	delete(p.machines, targetName)
-	p.machinesMu.Unlock()
+	return p.stopSelectedMachine(targetMachine, targetName)
+}
 
-	err := targetMachine.StopVMM()
+func (p *Pool) stopSelectedMachine(targetMachine *Machine, targetName string) error {
+	err := targetMachine.Stop()
 	if err != nil {
+		p.machinesMu.Lock()
+		current, exists := p.machines[targetName]
+		if exists && current == targetMachine {
+			current.stopping = false
+		}
+		p.machinesMu.Unlock()
 		p.logger.Warn().Err(err).Msgf("Failed to stop VM %s", targetName)
 		return err
 	}

@@ -17,16 +17,22 @@ import (
 type Machine struct {
 	*firecracker.Machine
 
-	Name      string
-	RunnerID  int64
-	Pool      string
-	CreatedAt time.Time
+	Name        string
+	RunnerID    int64
+	Pool        string
+	CreatedAt   time.Time
+	MemoryMib   int64
+	VCPUCount   int64
+	Reservation *CapacityReservation
 
 	vsockCID    uint32
 	vsockPath   string
 	leaseCancel func(context.Context) error // containerd lease cancel function
 	vmmCtx      context.Context
 	vmmCancel   context.CancelFunc
+	waitFunc    func(context.Context) error
+	stopFunc    func() error
+	stopping    bool
 }
 
 func (m *Machine) ConnectToGuestAgent(ctx context.Context) (*grpc.ClientConn, agentv1.AgentServiceClient, error) {
@@ -51,9 +57,33 @@ func (m *Machine) ConnectToGuestAgent(ctx context.Context) (*grpc.ClientConn, ag
 
 func (m *Machine) GetAddr() string {
 	addr := ""
-	if len(m.Cfg.NetworkInterfaces) > 0 {
+	if m.Machine != nil && len(m.Cfg.NetworkInterfaces) > 0 {
 		addr = m.Cfg.NetworkInterfaces[0].StaticConfiguration.IPConfiguration.IPAddr.IP.String()
 	}
 
 	return addr
+}
+
+func (m *Machine) WaitForExit(ctx context.Context) error {
+	if m.waitFunc != nil {
+		return m.waitFunc(ctx)
+	}
+
+	if m.Machine == nil {
+		return nil
+	}
+
+	return m.Wait(ctx)
+}
+
+func (m *Machine) Stop() error {
+	if m.stopFunc != nil {
+		return m.stopFunc()
+	}
+
+	if m.Machine == nil {
+		return nil
+	}
+
+	return m.StopVMM()
 }

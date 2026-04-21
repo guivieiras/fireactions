@@ -151,7 +151,7 @@ func (c *onDemandController) processWorkflowJobEvent(event *githubv63.WorkflowJo
 		organization := c.organizationFromEvent(event)
 		poolName, matchResult := c.matchPool(organization, event.WorkflowJob.Labels)
 		if matchResult != "matched" {
-			c.logger.Debug().
+			c.logger.Info().
 				Int64("job_id", jobID).
 				Str("organization", organization).
 				Str("result", matchResult).

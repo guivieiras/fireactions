@@ -16,6 +16,13 @@ Example configuration file with all available options:
 bind_address: 0.0.0.0:8080
 
 #
+# Enable built-in on-demand scaling from GitHub workflow_job events.
+#
+# Default: false
+#
+on_demand: false
+
+#
 # Global host capacity limits across all pools.
 #
 capacity:
@@ -60,6 +67,11 @@ github:
   #
   # Default: 0
   app_id: 12345
+  #
+  # GitHub webhook secret used to validate workflow_job webhooks.
+  # Required when on_demand is enabled.
+  #
+  webhook_secret: your-webhook-secret
 
 #
 # Pools configuration.
@@ -121,6 +133,10 @@ pools:
     - self-hosted
     - fireactions-2vcpu-2gb
     - fireactions
+    #
+    # When on_demand is enabled, labels must include the pool name so Fireactions
+    # can map queued jobs to exactly one pool.
+    #
   #
   # Firecracker configuration.
   #

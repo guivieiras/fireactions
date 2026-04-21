@@ -45,7 +45,9 @@ type Pool struct {
 	machines              map[string]*Machine
 	installationID        atomic.Int64
 	logger                *zerolog.Logger
-	replicas              atomic.Int32
+	baseReplicas          atomic.Int32
+	demandReplicas        atomic.Int32
+	desiredReplicas       atomic.Int32
 	isActive              bool
 	scaleTrigger          chan struct{}
 	stopCh                chan struct{}
@@ -114,7 +116,8 @@ func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, 
 		shutdownWaitTimeout: 30 * time.Second,
 	}
 
-	p.replicas.Store(int32(config.Replicas))
+	p.baseReplicas.Store(int32(config.Replicas))
+	p.desiredReplicas.Store(int32(config.Replicas))
 
 	if _, err := os.Stat(p.GetDir()); os.IsNotExist(err) {
 		if err := os.MkdirAll(p.GetDir(), 0755); err != nil {
@@ -127,7 +130,7 @@ func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, 
 	metricPoolRunnersCurrent.
 		WithLabelValues(p.config.Name, p.config.Runner.Organization).Set(float64(p.GetCurrentSize()))
 	metricPoolRunnersDesired.
-		WithLabelValues(p.config.Name, p.config.Runner.Organization).Set(float64(p.config.Replicas))
+		WithLabelValues(p.config.Name, p.config.Runner.Organization).Set(float64(p.GetDesiredReplicas()))
 	metricPoolStatus.
 		WithLabelValues(p.config.Name).Set(1)
 
@@ -163,7 +166,7 @@ func (p *Pool) Run() {
 		}
 
 		curSize := p.GetCurrentSize()
-		desiredReplicas := p.GetReplicas()
+		desiredReplicas := p.GetDesiredReplicas()
 		pendingCreates := int(p.pendingCreates.Load())
 		pendingDeletes := int(p.pendingDeletes.Load())
 		netPending := pendingCreates - pendingDeletes
@@ -452,11 +455,26 @@ func (p *Pool) Resume() {
 
 	p.logger.Debug().Msgf("Pool %s state changed to active", p.config.Name)
 	p.isActive = true
+	p.TriggerScale()
 }
 
-// SetReplicas updates the desired replica count for the pool in a thread-safe manner.
+// SetReplicas updates the configured warm replica count for the pool in a thread-safe manner.
 func (p *Pool) SetReplicas(replicas int) {
-	p.replicas.Store(int32(replicas))
+	p.baseReplicas.Store(int32(replicas))
+	p.recomputeDesiredReplicas()
+}
+
+// SetDemandReplicas updates the on-demand replica target for the pool.
+func (p *Pool) SetDemandReplicas(replicas int) {
+	p.demandReplicas.Store(int32(replicas))
+	p.recomputeDesiredReplicas()
+}
+
+func (p *Pool) recomputeDesiredReplicas() {
+	baseReplicas := p.GetBaseReplicas()
+	demandReplicas := int(p.demandReplicas.Load())
+	desiredReplicas := max(baseReplicas, demandReplicas)
+	p.desiredReplicas.Store(int32(desiredReplicas))
 	p.TriggerScale()
 }
 
@@ -468,9 +486,19 @@ func (p *Pool) TriggerScale() {
 	}
 }
 
-// GetReplicas returns the desired replica count for the pool in a thread-safe manner.
+// GetBaseReplicas returns the configured warm replica count for the pool.
+func (p *Pool) GetBaseReplicas() int {
+	return int(p.baseReplicas.Load())
+}
+
+// GetDesiredReplicas returns the effective desired replica count for the pool in a thread-safe manner.
+func (p *Pool) GetDesiredReplicas() int {
+	return int(p.desiredReplicas.Load())
+}
+
+// GetReplicas returns the effective desired replica count for the pool in a thread-safe manner.
 func (p *Pool) GetReplicas() int {
-	return int(p.replicas.Load())
+	return p.GetDesiredReplicas()
 }
 
 // GetCurrentSize returns the current size of the pool.

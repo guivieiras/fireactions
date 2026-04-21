@@ -94,4 +94,22 @@ var (
 		Namespace: namespace,
 		Help:      "Number of VM admissions blocked by global capacity limits.",
 	}, []string{"pool", "organization", "resource"})
+
+	metricOnDemandJobsActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name:      "on_demand_jobs_active",
+		Namespace: namespace,
+		Help:      "Number of active queued or running workflow jobs targeting a pool.",
+	}, []string{"pool", "organization"})
+
+	metricOnDemandWebhookEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name:      "on_demand_webhook_events_total",
+		Namespace: namespace,
+		Help:      "Number of processed GitHub on-demand webhook events.",
+	}, []string{"action", "result"})
+
+	metricOnDemandReconciliations = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name:      "on_demand_reconciliations_total",
+		Namespace: namespace,
+		Help:      "Number of on-demand reconciliation cycles.",
+	}, []string{"result"})
 )

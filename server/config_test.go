@@ -69,12 +69,33 @@ func TestConfigValidateRejectsNilPoolEntry(t *testing.T) {
 	assert.Contains(t, err.Error(), "pool at index 0 is required")
 }
 
+func TestConfigValidateOnDemandRequiresWebhookSecret(t *testing.T) {
+	config := minimalValidConfig()
+	config.OnDemand = true
+
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "webhook_secret")
+}
+
+func TestConfigValidateOnDemandRequiresPoolNameLabel(t *testing.T) {
+	config := minimalValidConfig()
+	config.OnDemand = true
+	config.GitHub.WebhookSecret = "secret"
+	config.Pools[0].Runner.Labels = []string{"self-hosted"}
+
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "runner.labels must include the pool name")
+}
+
 func minimalValidConfig() *Config {
 	config := DefaultConfig()
 	config.BindAddress = "127.0.0.1:8080"
 	config.GitHub = &GitHubConfig{
 		AppPrivateKey: "private-key",
 		AppID:         1,
+		WebhookSecret: "",
 	}
 	config.LogLevel = "info"
 	config.Pools = []*PoolConfig{{
@@ -87,7 +108,7 @@ func minimalValidConfig() *Config {
 			Image:           "ghcr.io/example/fireactions:test",
 			Organization:    "example",
 			GroupID:         1,
-			Labels:          []string{"self-hosted"},
+			Labels:          []string{"self-hosted", "default"},
 		},
 		Firecracker: &FirecrackerConfig{
 			KernelImagePath: "/var/lib/fireactions/vmlinux",

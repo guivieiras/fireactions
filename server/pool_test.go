@@ -140,6 +140,20 @@ func TestPoolScaleUpBlocksWithoutIncrementingPendingCreatesForDeniedVMs(t *testi
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestPoolDesiredReplicasUsesMaxOfBaseAndDemand(t *testing.T) {
+	pool := newTestPool(t, "pool-demand", 2048, 2, NewCapacityManager(nil))
+
+	pool.SetReplicas(1)
+	assert.Equal(t, 1, pool.GetBaseReplicas())
+	assert.Equal(t, 1, pool.GetDesiredReplicas())
+
+	pool.SetDemandReplicas(3)
+	assert.Equal(t, 3, pool.GetDesiredReplicas())
+
+	pool.SetDemandReplicas(0)
+	assert.Equal(t, 1, pool.GetDesiredReplicas())
+}
+
 func TestPoolCreateFailureReleasesCapacity(t *testing.T) {
 	capacity := NewCapacityManager(&CapacityConfig{
 		MemoryLimitMib: 2048,
@@ -363,13 +377,14 @@ func newTestPool(t *testing.T, name string, memoryMib, vcpuCount int64, capacity
 		config: &PoolConfig{
 			Name:           name,
 			ShutdownOnExit: boolPtr(true),
+			Replicas:       0,
 			Runner: &RunnerConfig{
 				Name:            name,
 				ImagePullPolicy: "IfNotPresent",
 				Image:           "test-image",
 				Organization:    "test-org",
 				GroupID:         1,
-				Labels:          []string{"self-hosted"},
+				Labels:          []string{"self-hosted", name},
 			},
 			Firecracker: &FirecrackerConfig{
 				MachineConfig: FirecrackerMachineConfig{
@@ -392,6 +407,8 @@ func newTestPool(t *testing.T, name string, memoryMib, vcpuCount int64, capacity
 		nextCID:             &nextCID,
 		shutdownWaitTimeout: 30 * time.Second,
 	}
+	pool.baseReplicas.Store(int32(pool.config.Replicas))
+	pool.desiredReplicas.Store(int32(pool.config.Replicas))
 
 	t.Cleanup(func() {
 		cancel()

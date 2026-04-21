@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/go-playground/validator/v10"
 	"gopkg.in/yaml.v3"
@@ -11,6 +12,7 @@ import (
 // Config is the configuration for the Client.
 type Config struct {
 	BindAddress      string            `yaml:"bind_address" validate:"required,hostname_port"`
+	OnDemand         bool              `yaml:"on_demand" validate:""`
 	Capacity         *CapacityConfig   `yaml:"capacity"`
 	Containerd       *ContainerdConfig `yaml:"containerd" validate:"required"`
 	Metrics          *MetricsConfig    `yaml:"metrics"`
@@ -41,6 +43,7 @@ type MetricsConfig struct {
 type GitHubConfig struct {
 	AppPrivateKey string `yaml:"app_private_key" validate:"required"`
 	AppID         int64  `yaml:"app_id" validate:"required"`
+	WebhookSecret string `yaml:"webhook_secret" validate:""`
 }
 
 type RunnerConfig struct {
@@ -69,6 +72,7 @@ type FirecrackerMachineConfig struct {
 func DefaultConfig() *Config {
 	c := &Config{
 		BindAddress:      ":8080",
+		OnDemand:         false,
 		Capacity:         &CapacityConfig{},
 		Containerd:       &ContainerdConfig{Address: "/run/containerd/containerd.sock", Namespace: "fireactions"},
 		Metrics:          &MetricsConfig{Enabled: true, Address: ":8081"},
@@ -119,9 +123,21 @@ func (c *Config) Validate() error {
 	if c.Capacity == nil {
 		c.Capacity = &CapacityConfig{}
 	}
+	if c.Metrics == nil {
+		c.Metrics = &MetricsConfig{}
+	}
 
 	if err := validator.New().Struct(c); err != nil {
 		return err
+	}
+
+	if c.OnDemand {
+		if c.GitHub == nil || c.GitHub.WebhookSecret == "" {
+			return fmt.Errorf("github webhook_secret is required when on_demand is enabled")
+		}
+		if c.Metrics.Address == "" {
+			return fmt.Errorf("metrics address is required when on_demand is enabled")
+		}
 	}
 
 	for i, pool := range c.Pools {
@@ -149,6 +165,10 @@ func (c *Config) Validate() error {
 		if c.Capacity.VCPULimit > 0 && pool.Firecracker.MachineConfig.VcpuCount > c.Capacity.VCPULimit {
 			return fmt.Errorf("pool %q vcpu_count %d exceeds capacity.vcpu_limit %d",
 				pool.Name, pool.Firecracker.MachineConfig.VcpuCount, c.Capacity.VCPULimit)
+		}
+
+		if c.OnDemand && !slices.Contains(pool.Runner.Labels, pool.Name) {
+			return fmt.Errorf("pool %q runner.labels must include the pool name when on_demand is enabled", pool.Name)
 		}
 	}
 

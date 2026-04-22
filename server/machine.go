@@ -25,14 +25,15 @@ type Machine struct {
 	VCPUCount   int64
 	Reservation *CapacityReservation
 
-	vsockCID    uint32
-	vsockPath   string
-	leaseCancel func(context.Context) error // containerd lease cancel function
-	vmmCtx      context.Context
-	vmmCancel   context.CancelFunc
-	waitFunc    func(context.Context) error
-	stopFunc    func() error
-	stopping    bool
+	vsockCID      uint32
+	vsockPath     string
+	leaseCancel   func(context.Context) error // containerd lease cancel function
+	vmmCtx        context.Context
+	vmmCancel     context.CancelFunc
+	waitFunc      func(context.Context) error
+	runnerStateFn func(context.Context) (string, error)
+	stopFunc      func() error
+	stopping      bool
 }
 
 func (m *Machine) ConnectToGuestAgent(ctx context.Context) (*grpc.ClientConn, agentv1.AgentServiceClient, error) {
@@ -74,6 +75,39 @@ func (m *Machine) WaitForExit(ctx context.Context) error {
 	}
 
 	return m.Wait(ctx)
+}
+
+func (m *Machine) GetRunnerState(ctx context.Context) (string, error) {
+	if m.runnerStateFn != nil {
+		return m.runnerStateFn(ctx)
+	}
+
+	conn, client, err := m.ConnectToGuestAgent(ctx)
+	if err != nil {
+		return "", fmt.Errorf("connect to agent: %w", err)
+	}
+	defer conn.Close()
+
+	resp, err := client.GetRunnerState(ctx, &agentv1.GetRunnerStateRequest{})
+	if err != nil {
+		return "", fmt.Errorf("agent GetRunnerState: %w", err)
+	}
+
+	return resp.GetState(), nil
+}
+
+func (m *Machine) IsIdleForScaleDown(ctx context.Context) (bool, string, error) {
+	state, err := m.GetRunnerState(ctx)
+	if err != nil {
+		return false, "", err
+	}
+
+	switch state {
+	case "Idle", "Completed", "Exited", "Error":
+		return true, state, nil
+	default:
+		return false, state, nil
+	}
 }
 
 func (m *Machine) Stop() error {

@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,8 +31,12 @@ import (
 )
 
 const (
-	defaultSnapshotter = "devmapper"
+	defaultSnapshotter        = "devmapper"
+	scaleDownStateTimeout     = 2 * time.Second
+	scaleDownRunnerAPITimeout = 10 * time.Second
 )
+
+var errBusyRunner = errors.New("runner is busy")
 
 // Pool represents a pool of Firecracker VMs that are used to run GitHub Actions jobs.
 type Pool struct {
@@ -59,6 +65,7 @@ type Pool struct {
 	l                     *sync.Mutex
 	capacityBlockedReason CapacityBlockReason
 	createMachineFn       func(context.Context, *CapacityReservation) error
+	removeRunnerFn        func(context.Context, string, int64) error
 	shutdownWaitTimeout   time.Duration
 }
 
@@ -360,7 +367,7 @@ func (p *Pool) scaleDown(ctx context.Context, count, desiredReplicas, curSize, p
 		count, desiredReplicas, curSize, pendingCreates, pendingDeletes)
 
 	for i := 0; i < count; i++ {
-		targetMachine, targetName, ok := p.beginDeleteMachine()
+		targetMachine, targetName, ok := p.beginDeleteMachine(ctx)
 		if !ok {
 			return
 		}
@@ -378,6 +385,10 @@ func (p *Pool) scaleDown(ctx context.Context, count, desiredReplicas, curSize, p
 
 			start := time.Now()
 			if err := p.stopSelectedMachine(targetMachine, targetName); err != nil {
+				if errors.Is(err, errBusyRunner) {
+					p.logger.Info().Str("machine", targetName).Msg("Skipping scale down for busy runner")
+					return
+				}
 				metricScaleOperations.WithLabelValues(p.config.Name, p.config.Runner.Organization, "down", "failure").Inc()
 				p.logger.Error().Err(err).Msg("Failed to delete machine")
 				return
@@ -740,7 +751,11 @@ func (p *Pool) trackMachine(machine *Machine) {
 			machine.vmmCancel()
 		}
 
-		p.deleteGitHubRunner(machine.Name, machine.RunnerID)
+		ctx, cancel := context.WithTimeout(context.Background(), scaleDownRunnerAPITimeout)
+		if err := p.removeGitHubRunner(ctx, machine.Name, machine.RunnerID); err != nil && !errors.Is(err, errBusyRunner) {
+			p.logger.Error().Err(err).Msgf("Failed to delete GitHub runner %s (ID: %d)", machine.Name, machine.RunnerID)
+		}
+		cancel()
 
 		if machine.leaseCancel != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -755,34 +770,67 @@ func (p *Pool) trackMachine(machine *Machine) {
 	}()
 }
 
-func (p *Pool) beginDeleteMachine() (*Machine, string, bool) {
-	p.machinesMu.Lock()
-	defer p.machinesMu.Unlock()
+func (p *Pool) beginDeleteMachine(ctx context.Context) (*Machine, string, bool) {
+	type deleteCandidate struct {
+		name    string
+		machine *Machine
+	}
 
-	// Find a machine to remove (pick the first non-stopping one)
-	var targetMachine *Machine
-	var targetName string
+	p.machinesMu.Lock()
+	candidates := make([]deleteCandidate, 0, len(p.machines))
 	for name, machine := range p.machines {
 		if machine.stopping {
 			continue
 		}
 
-		machine.stopping = true
-		targetMachine = machine
-		targetName = name
-		break
+		candidates = append(candidates, deleteCandidate{name: name, machine: machine})
+	}
+	p.machinesMu.Unlock()
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].machine.CreatedAt.Equal(candidates[j].machine.CreatedAt) {
+			return candidates[i].name < candidates[j].name
+		}
+		return candidates[i].machine.CreatedAt.Before(candidates[j].machine.CreatedAt)
+	})
+
+	for _, candidate := range candidates {
+		stateCtx, cancel := context.WithTimeout(ctx, scaleDownStateTimeout)
+		idle, state, err := candidate.machine.IsIdleForScaleDown(stateCtx)
+		cancel()
+		if err != nil {
+			p.logger.Debug().
+				Str("machine", candidate.name).
+				Err(err).
+				Msg("Skipping scale down candidate because runner state is unavailable")
+			continue
+		}
+		if !idle {
+			p.logger.Debug().
+				Str("machine", candidate.name).
+				Str("runner_state", state).
+				Msg("Skipping scale down candidate because runner is not idle")
+			continue
+		}
+
+		p.machinesMu.Lock()
+		current, exists := p.machines[candidate.name]
+		if !exists || current != candidate.machine || current.stopping {
+			p.machinesMu.Unlock()
+			continue
+		}
+
+		current.stopping = true
+		p.machinesMu.Unlock()
+		return current, candidate.name, true
 	}
 
-	if targetMachine == nil {
-		return nil, "", false
-	}
-
-	return targetMachine, targetName, true
+	return nil, "", false
 }
 
 // removeMachine removes a single machine from the pool.
-func (p *Pool) deleteMachine(_ context.Context) error {
-	targetMachine, targetName, ok := p.beginDeleteMachine()
+func (p *Pool) deleteMachine(ctx context.Context) error {
+	targetMachine, targetName, ok := p.beginDeleteMachine(ctx)
 	if !ok {
 		return fmt.Errorf("no machines available to scale down")
 	}
@@ -791,7 +839,10 @@ func (p *Pool) deleteMachine(_ context.Context) error {
 }
 
 func (p *Pool) stopSelectedMachine(targetMachine *Machine, targetName string) error {
-	err := targetMachine.Stop()
+	runnerRemoved := false
+	ctx, cancel := context.WithTimeout(context.Background(), scaleDownRunnerAPITimeout)
+	err := p.removeGitHubRunner(ctx, targetName, targetMachine.RunnerID)
+	cancel()
 	if err != nil {
 		p.machinesMu.Lock()
 		current, exists := p.machines[targetName]
@@ -799,6 +850,24 @@ func (p *Pool) stopSelectedMachine(targetMachine *Machine, targetName string) er
 			current.stopping = false
 		}
 		p.machinesMu.Unlock()
+		if errors.Is(err, errBusyRunner) {
+			return err
+		}
+		p.logger.Warn().Err(err).Msgf("Failed to deregister runner %s before stopping VM", targetName)
+		return err
+	}
+	runnerRemoved = targetMachine.RunnerID != 0
+
+	err = targetMachine.Stop()
+	if err != nil {
+		if !runnerRemoved {
+			p.machinesMu.Lock()
+			current, exists := p.machines[targetName]
+			if exists && current == targetMachine {
+				current.stopping = false
+			}
+			p.machinesMu.Unlock()
+		}
 		p.logger.Warn().Err(err).Msgf("Failed to stop VM %s", targetName)
 		return err
 	}
@@ -840,29 +909,56 @@ func (p *Pool) createSnapshot(ctx context.Context, image containerd.Image, snaps
 	return mounts, nil
 }
 
-// deleteGitHubRunner removes a runner from GitHub Actions
-func (p *Pool) deleteGitHubRunner(runnerName string, runnerID int64) {
+// removeGitHubRunner removes a runner from GitHub Actions.
+func (p *Pool) removeGitHubRunner(ctx context.Context, runnerName string, runnerID int64) error {
 	if runnerID == 0 {
-		p.logger.Debug().Msgf("No GitHub runner ID found for %s, skipping deletion", runnerName)
-		return
+		return nil
+	}
+
+	if p.removeRunnerFn != nil {
+		err := p.removeRunnerFn(ctx, runnerName, runnerID)
+		if err == nil {
+			return nil
+		}
+		switch {
+		case isGitHubResponseStatus(err, 404):
+			return nil
+		case isGitHubResponseStatus(err, 422):
+			return errBusyRunner
+		default:
+			return err
+		}
 	}
 
 	if p.installationID.Load() == 0 {
-		p.logger.Warn().Msgf("No installation ID available, cannot delete runner %s", runnerName)
-		return
+		return fmt.Errorf("no installation ID available, cannot delete runner %s", runnerName)
 	}
 
 	client := p.github.Installation(p.installationID.Load())
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	_, err := client.Actions.RemoveOrganizationRunner(ctx, p.config.Runner.Organization, runnerID)
 	if err != nil {
-		p.logger.Error().Err(err).Msgf("Failed to delete GitHub runner %s (ID: %d)", runnerName, runnerID)
-		return
+		switch {
+		case isGitHubResponseStatus(err, 404):
+			p.logger.Debug().Msgf("GitHub runner %s (ID: %d) was already deleted", runnerName, runnerID)
+			return nil
+		case isGitHubResponseStatus(err, 422):
+			return errBusyRunner
+		default:
+			return err
+		}
 	}
 
 	p.logger.Debug().Msgf("Successfully deleted GitHub runner %s (ID: %d)", runnerName, runnerID)
+	return nil
+}
+
+func isGitHubResponseStatus(err error, statusCode int) bool {
+	var responseErr *githubv63.ErrorResponse
+	if !errors.As(err, &responseErr) || responseErr.Response == nil {
+		return false
+	}
+
+	return responseErr.Response.StatusCode == statusCode
 }
 
 func init() {

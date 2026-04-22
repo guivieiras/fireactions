@@ -12,12 +12,15 @@ import (
 )
 
 const (
-	onDemandReconcileInterval = 60 * time.Second
+	onDemandReconcileInterval  = 60 * time.Second
+	onDemandMissingJobGrace    = 2 * onDemandReconcileInterval
+	onDemandCompletedJobWindow = 2 * onDemandReconcileInterval
 )
 
 type jobDemandEntry struct {
 	organization string
 	poolName     string
+	lastSeenAt   time.Time
 }
 
 type onDemandController struct {
@@ -28,7 +31,9 @@ type onDemandController struct {
 
 	mu              sync.Mutex
 	jobs            map[int64]*jobDemandEntry
+	completedJobs   map[int64]time.Time
 	installationIDs map[string]int64
+	nowFn           func() time.Time
 
 	listRepositoriesFn func(context.Context, int64) ([]*githubv63.Repository, error)
 	listWorkflowRunsFn func(context.Context, int64, string, string, string) ([]*githubv63.WorkflowRun, error)
@@ -43,7 +48,9 @@ func newOnDemandController(server *Server) *onDemandController {
 		webhookSecret:   []byte(server.config.GitHub.WebhookSecret),
 		pollInterval:    onDemandReconcileInterval,
 		jobs:            make(map[int64]*jobDemandEntry),
+		completedJobs:   make(map[int64]time.Time),
 		installationIDs: make(map[string]int64),
+		nowFn:           time.Now,
 	}
 	controller.listRepositoriesFn = controller.listRepositories
 	controller.listWorkflowRunsFn = controller.listWorkflowRuns
@@ -237,12 +244,24 @@ func (c *onDemandController) reconcileOnce(ctx context.Context) error {
 		}
 	}
 
-	c.replaceJobs(reconciledJobs)
+	c.mergeReconciledJobs(reconciledJobs, c.now())
 	return nil
 }
 
 func (c *onDemandController) upsertJob(jobID int64, entry *jobDemandEntry) {
+	now := c.now()
+
 	c.mu.Lock()
+	c.pruneCompletedJobsLocked(now)
+	if completedAt, ok := c.completedJobs[jobID]; ok && now.Sub(completedAt) <= onDemandCompletedJobWindow {
+		poolDemand := c.poolDemandLocked()
+		c.mu.Unlock()
+		c.applyPoolDemand(poolDemand)
+		return
+	}
+
+	delete(c.completedJobs, jobID)
+	entry.lastSeenAt = now
 	c.jobs[jobID] = entry
 	poolDemand := c.poolDemandLocked()
 	c.mu.Unlock()
@@ -251,30 +270,81 @@ func (c *onDemandController) upsertJob(jobID int64, entry *jobDemandEntry) {
 }
 
 func (c *onDemandController) removeJob(jobID int64) {
+	now := c.now()
+
 	c.mu.Lock()
 	delete(c.jobs, jobID)
+	c.completedJobs[jobID] = now
+	c.pruneCompletedJobsLocked(now)
 	poolDemand := c.poolDemandLocked()
 	c.mu.Unlock()
 
 	c.applyPoolDemand(poolDemand)
 }
 
-func (c *onDemandController) replaceJobs(jobs map[int64]*jobDemandEntry) {
+func (c *onDemandController) mergeReconciledJobs(jobs map[int64]*jobDemandEntry, now time.Time) {
 	c.mu.Lock()
-	c.jobs = jobs
+	c.pruneCompletedJobsLocked(now)
+
+	mergedJobs := make(map[int64]*jobDemandEntry, len(c.jobs)+len(jobs))
+	for jobID, existing := range c.jobs {
+		if existing == nil {
+			continue
+		}
+		if now.Sub(existing.lastSeenAt) > onDemandMissingJobGrace {
+			continue
+		}
+
+		entryCopy := *existing
+		mergedJobs[jobID] = &entryCopy
+	}
+
+	for jobID, job := range jobs {
+		if job == nil {
+			continue
+		}
+		if completedAt, ok := c.completedJobs[jobID]; ok && now.Sub(completedAt) <= onDemandCompletedJobWindow {
+			continue
+		}
+
+		entryCopy := *job
+		entryCopy.lastSeenAt = now
+		mergedJobs[jobID] = &entryCopy
+	}
+
+	c.jobs = mergedJobs
 	poolDemand := c.poolDemandLocked()
 	c.mu.Unlock()
 
 	c.applyPoolDemand(poolDemand)
+}
+
+func (c *onDemandController) pruneCompletedJobsLocked(now time.Time) {
+	for jobID, completedAt := range c.completedJobs {
+		if now.Sub(completedAt) > onDemandCompletedJobWindow {
+			delete(c.completedJobs, jobID)
+		}
+	}
 }
 
 func (c *onDemandController) poolDemandLocked() map[string]int {
 	poolDemand := make(map[string]int)
 	for _, job := range c.jobs {
+		if job == nil {
+			continue
+		}
 		poolDemand[job.poolName]++
 	}
 
 	return poolDemand
+}
+
+func (c *onDemandController) now() time.Time {
+	if c.nowFn == nil {
+		return time.Now().UTC()
+	}
+
+	return c.nowFn().UTC()
 }
 
 func (c *onDemandController) applyPoolDemand(poolDemand map[string]int) {

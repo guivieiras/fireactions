@@ -41,21 +41,20 @@ func convertMachineToProto(ctx context.Context, machine *Machine) *serverv1.Mach
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	conn, client, err := machine.ConnectToGuestAgent(ctx)
+	runnerState, err := machine.GetRunnerState(ctx)
 	if err != nil {
 		m.RunnerState = "Unknown"
 		m.RunnerVersion = "Unknown"
 		return m
 	}
-	defer conn.Close()
+	m.RunnerState = runnerState
 
-	runnerStateResp, err := client.GetRunnerState(
-		ctx, &agentv1.GetRunnerStateRequest{})
+	conn, client, err := machine.ConnectToGuestAgent(ctx)
 	if err != nil {
-		m.RunnerState = "Unknown"
-	} else {
-		m.RunnerState = runnerStateResp.GetState()
+		m.RunnerVersion = "Unknown"
+		return m
 	}
+	defer conn.Close()
 
 	runnerVersionResp, err := client.GetRunnerVersion(
 		ctx, &agentv1.GetRunnerVersionRequest{})

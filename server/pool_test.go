@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	githubv63 "github.com/google/go-github/v63/github"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
@@ -196,6 +198,9 @@ func TestPoolDeleteMachineKeepsReservationOnStopFailure(t *testing.T) {
 			<-ctx.Done()
 			return nil
 		},
+		runnerStateFn: func(context.Context) (string, error) {
+			return "Idle", nil
+		},
 		stopFunc: func() error {
 			return errors.New("stop failed")
 		},
@@ -318,6 +323,9 @@ func TestPoolScaleDoesNotDoubleCountSlowDelete(t *testing.T) {
 		Name:      "slow-delete",
 		Pool:      pool.config.Name,
 		CreatedAt: time.Now().UTC(),
+		runnerStateFn: func(context.Context) (string, error) {
+			return "Idle", nil
+		},
 		stopFunc: func() error {
 			stopCalls.Add(1)
 			<-stopRelease
@@ -341,6 +349,118 @@ func TestPoolScaleDoesNotDoubleCountSlowDelete(t *testing.T) {
 	assert.Equal(t, int32(1), stopCalls.Load())
 
 	close(stopRelease)
+}
+
+func TestPoolScaleDownSelectsIdleMachinesOnly(t *testing.T) {
+	pool := newTestPool(t, "pool-busy-selection", 2048, 2, NewCapacityManager(nil))
+
+	var idleStopCalls atomic.Int32
+	idle := &Machine{
+		Name:      "idle",
+		Pool:      pool.config.Name,
+		CreatedAt: time.Now().UTC().Add(-time.Minute),
+		RunnerID:  11,
+		runnerStateFn: func(context.Context) (string, error) {
+			return "Idle", nil
+		},
+		stopFunc: func() error {
+			idleStopCalls.Add(1)
+			return nil
+		},
+	}
+
+	var busyStopCalls atomic.Int32
+	busy := &Machine{
+		Name:      "busy",
+		Pool:      pool.config.Name,
+		CreatedAt: time.Now().UTC(),
+		RunnerID:  22,
+		runnerStateFn: func(context.Context) (string, error) {
+			return "Running", nil
+		},
+		stopFunc: func() error {
+			busyStopCalls.Add(1)
+			return nil
+		},
+	}
+
+	pool.removeRunnerFn = func(context.Context, string, int64) error { return nil }
+
+	pool.machinesMu.Lock()
+	pool.machines[idle.Name] = idle
+	pool.machines[busy.Name] = busy
+	pool.machinesMu.Unlock()
+
+	require.NoError(t, pool.Scale(context.Background(), 0))
+
+	require.Eventually(t, func() bool {
+		return idleStopCalls.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(0), busyStopCalls.Load())
+	assert.False(t, busy.stopping)
+}
+
+func TestPoolScaleDownKeepsBusyMachineWhenDemandDrops(t *testing.T) {
+	pool := newTestPool(t, "pool-busy-only", 2048, 2, NewCapacityManager(nil))
+
+	var stopCalls atomic.Int32
+	machine := &Machine{
+		Name:      "busy-only",
+		Pool:      pool.config.Name,
+		CreatedAt: time.Now().UTC(),
+		RunnerID:  33,
+		runnerStateFn: func(context.Context) (string, error) {
+			return "Running", nil
+		},
+		stopFunc: func() error {
+			stopCalls.Add(1)
+			return nil
+		},
+	}
+
+	pool.removeRunnerFn = func(context.Context, string, int64) error { return nil }
+
+	pool.machinesMu.Lock()
+	pool.machines[machine.Name] = machine
+	pool.machinesMu.Unlock()
+
+	require.NoError(t, pool.Scale(context.Background(), 0))
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Equal(t, int32(0), stopCalls.Load())
+	assert.False(t, machine.stopping)
+}
+
+func TestPoolDeleteMachineSkipsRunnerThatTurnsBusyDuringDelete(t *testing.T) {
+	pool := newTestPool(t, "pool-race-delete", 2048, 2, NewCapacityManager(nil))
+
+	var stopCalls atomic.Int32
+	machine := &Machine{
+		Name:      "race-delete",
+		Pool:      pool.config.Name,
+		CreatedAt: time.Now().UTC(),
+		RunnerID:  44,
+		runnerStateFn: func(context.Context) (string, error) {
+			return "Idle", nil
+		},
+		stopFunc: func() error {
+			stopCalls.Add(1)
+			return nil
+		},
+	}
+
+	pool.removeRunnerFn = func(context.Context, string, int64) error {
+		return &githubv63.ErrorResponse{Response: &http.Response{StatusCode: 422}}
+	}
+
+	pool.machinesMu.Lock()
+	pool.machines[machine.Name] = machine
+	pool.machinesMu.Unlock()
+
+	err := pool.deleteMachine(context.Background())
+	require.ErrorIs(t, err, errBusyRunner)
+	assert.Equal(t, int32(0), stopCalls.Load())
+	assert.False(t, machine.stopping)
 }
 
 type fakeMachineRuntime struct {

@@ -686,25 +686,32 @@ func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservati
 		return fmt.Errorf("firecracker: starting machine: %w", err)
 	}
 
+	processID, err := fcMachine.PID()
+	if err != nil {
+		p.logger.Warn().Err(err).Msgf("Failed to resolve Firecracker process ID for VM %s; host VM metrics will be unavailable", runnerName)
+	}
+
 	// Mark machine as successfully created
 	machineCreated = true
 
 	p.logger.Info().Msgf("Successfully created Firecracker VM %s", runnerName)
 
 	machine := &Machine{
-		Machine:     fcMachine,
-		Name:        jitConfig.GetRunner().GetName(),
-		RunnerID:    jitConfig.GetRunner().GetID(),
-		Pool:        p.config.Name,
-		CreatedAt:   time.Now().UTC(),
-		MemoryMib:   p.config.Firecracker.MachineConfig.MemSizeMib,
-		VCPUCount:   p.config.Firecracker.MachineConfig.VcpuCount,
-		Reservation: reservation,
-		vsockCID:    vsockCID,
-		vsockPath:   vsockPath,
-		leaseCancel: leaseCtxCancel,
-		vmmCtx:      vmmCtx,
-		vmmCancel:   vmmCancel,
+		Machine:      fcMachine,
+		Name:         jitConfig.GetRunner().GetName(),
+		RunnerID:     jitConfig.GetRunner().GetID(),
+		Pool:         p.config.Name,
+		Organization: p.config.Runner.Organization,
+		ProcessID:    processID,
+		CreatedAt:    time.Now().UTC(),
+		MemoryMib:    p.config.Firecracker.MachineConfig.MemSizeMib,
+		VCPUCount:    p.config.Firecracker.MachineConfig.VcpuCount,
+		Reservation:  reservation,
+		vsockCID:     vsockCID,
+		vsockPath:    vsockPath,
+		leaseCancel:  leaseCtxCancel,
+		vmmCtx:       vmmCtx,
+		vmmCancel:    vmmCancel,
 	}
 
 	p.trackMachine(machine)
@@ -713,13 +720,20 @@ func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservati
 }
 
 func (p *Pool) trackMachine(machine *Machine) {
+	if machine.Organization == "" {
+		machine.Organization = p.config.Runner.Organization
+	}
+
 	p.machinesMu.Lock()
 	p.machines[machine.Name] = machine
 	p.machinesMu.Unlock()
 
+	metricVMHostProcess.track(machine)
+
 	p.cleanupWg.Add(1)
 	go func() {
 		defer p.cleanupWg.Done()
+		defer metricVMHostProcess.untrack(machine)
 
 		waitDone := make(chan error, 1)
 		go func() {

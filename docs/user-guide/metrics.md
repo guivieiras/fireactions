@@ -23,6 +23,10 @@ The following metrics are available, excluding the default Prometheus metrics:
 | `fireactions_capacity_vcpu_limit`            | Gauge     | Configured global guest vCPU limit                        | None                                             |
 | `fireactions_capacity_vcpu_reserved`         | Gauge     | Reserved global guest vCPU capacity                       | None                                             |
 | `fireactions_capacity_admission_blocks_total`| Counter   | VM admissions blocked by global capacity                  | `pool`, `organization`, `resource`               |
+| `fireactions_vm_cpu_seconds_total`           | Counter   | Cumulative host-observed CPU seconds for an active VM      | `pool`, `organization`, `runner`                 |
+| `fireactions_vm_memory_rss_bytes`            | Gauge     | Current host-observed Firecracker process RSS bytes        | `pool`, `organization`, `runner`                 |
+| `fireactions_vm_configured_memory_bytes`     | Gauge     | Configured guest memory bytes for an active VM             | `pool`, `organization`, `runner`                 |
+| `fireactions_vm_configured_vcpus`            | Gauge     | Configured guest vCPU count for an active VM               | `pool`, `organization`, `runner`                 |
 
 
 Example Grafana dashboard for vizualisation of Fireactions metrics:

@@ -17,13 +17,15 @@ import (
 type Machine struct {
 	*firecracker.Machine
 
-	Name        string
-	RunnerID    int64
-	Pool        string
-	CreatedAt   time.Time
-	MemoryMib   int64
-	VCPUCount   int64
-	Reservation *CapacityReservation
+	Name         string
+	RunnerID     int64
+	Pool         string
+	Organization string
+	ProcessID    int
+	CreatedAt    time.Time
+	MemoryMib    int64
+	VCPUCount    int64
+	Reservation  *CapacityReservation
 
 	vsockCID      uint32
 	vsockPath     string

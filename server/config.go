@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -59,9 +60,12 @@ type FirecrackerConfig struct {
 	BinaryPath      string                   `yaml:"binary_path" `
 	KernelImagePath string                   `yaml:"kernel_image_path"`
 	KernelArgs      string                   `yaml:"kernel_args"`
+	CPUConfig       FirecrackerCPUConfig     `yaml:"cpu_config"`
 	MachineConfig   FirecrackerMachineConfig `yaml:"machine_config"`
 	Metadata        map[string]interface{}   `yaml:"metadata"`
 }
+
+type FirecrackerCPUConfig map[string]interface{}
 
 type FirecrackerMachineConfig struct {
 	VcpuCount  int64 `yaml:"vcpu_count" validate:"min=1"`
@@ -155,6 +159,12 @@ func (c *Config) Validate() error {
 
 		if pool.Firecracker.MachineConfig.VcpuCount < 1 {
 			return fmt.Errorf("pool %q vcpu_count must be at least 1", pool.Name)
+		}
+
+		if len(pool.Firecracker.CPUConfig) > 0 {
+			if _, err := json.Marshal(pool.Firecracker.CPUConfig); err != nil {
+				return fmt.Errorf("pool %q cpu_config must be JSON-compatible: %w", pool.Name, err)
+			}
 		}
 
 		if c.Capacity.MemoryLimitMib > 0 && pool.Firecracker.MachineConfig.MemSizeMib > c.Capacity.MemoryLimitMib {

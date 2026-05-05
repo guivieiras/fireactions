@@ -12,6 +12,10 @@ func TestNewConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "testdata/config1.yaml", config.path)
+	require.Len(t, config.Pools, 2)
+	assert.NotEmpty(t, config.Pools[0].Firecracker.CPUConfig)
+	assert.Empty(t, config.Pools[1].Firecracker.CPUConfig)
+	require.Contains(t, config.Pools[0].Firecracker.CPUConfig, "cpuid_modifiers")
 }
 
 func TestConfigValidateCapacityDefaults(t *testing.T) {

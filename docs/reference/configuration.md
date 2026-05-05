@@ -160,6 +160,20 @@ pools:
     #
     kernel_args: "console=ttyS0 noapic reboot=k panic=1 pci=off nomodules rw"
     #
+    # Optional Firecracker CPU configuration passed to the pre-boot /cpu-config API.
+    # This can expose or mask CPUID/MSR/KVM capability bits for specialized guests.
+    #
+    # Default: {}
+    #
+    cpu_config:
+      cpuid_modifiers:
+      - leaf: "0x80000001"
+        subleaf: "0x0"
+        flags: 0
+        modifiers:
+        - register: ecx
+          bitmap: "0bxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1xx"
+    #
     # Firecracker machine configuration.
     #
     # Required: true

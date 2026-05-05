@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,6 +37,7 @@ const (
 	defaultSnapshotter        = "devmapper"
 	scaleDownStateTimeout     = 2 * time.Second
 	scaleDownRunnerAPITimeout = 10 * time.Second
+	configureCPUHandlerName   = "fcinit.ConfigureCPU"
 )
 
 var errBusyRunner = errors.New("runner is busy")
@@ -648,6 +652,17 @@ func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservati
 	if err != nil {
 		return fmt.Errorf("firecracker: creating machine: %w", err)
 	}
+	if len(p.config.Firecracker.CPUConfig) > 0 {
+		fcMachine.Handlers.FcInit = fcMachine.Handlers.FcInit.AppendAfter(
+			firecracker.BootstrapLoggingHandlerName,
+			firecracker.Handler{
+				Name: configureCPUHandlerName,
+				Fn: func(ctx context.Context, m *firecracker.Machine) error {
+					return putFirecrackerCPUConfig(ctx, m.Cfg.SocketPath, p.config.Firecracker.CPUConfig)
+				},
+			},
+		)
+	}
 
 	installationID := p.installationID.Load()
 	if installationID == 0 {
@@ -782,6 +797,40 @@ func (p *Pool) trackMachine(machine *Machine) {
 
 		p.logger.Info().Msgf("Successfully cleaned up exited Firecracker VM %s", machine.Name)
 	}()
+}
+
+func putFirecrackerCPUConfig(ctx context.Context, socketPath string, cpuConfig FirecrackerCPUConfig) error {
+	body, err := json.Marshal(cpuConfig)
+	if err != nil {
+		return fmt.Errorf("marshal cpu_config: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://unix/cpu-config", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create cpu-config request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("put cpu-config: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("put cpu-config returned %s: %s", resp.Status, bytes.TrimSpace(responseBody))
+	}
+
+	return nil
 }
 
 func (p *Pool) beginDeleteMachine(ctx context.Context) (*Machine, string, bool) {

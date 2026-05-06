@@ -67,6 +67,34 @@ func TestOnDemandWebhookScalesPoolWhenJobOnlyRequestsPoolLabel(t *testing.T) {
 	assert.Equal(t, 1, poolA.GetDesiredReplicas())
 }
 
+func TestOnDemandWebhookStoresWorkflowRunnerNameMetadata(t *testing.T) {
+	server, poolA, _ := newOnDemandTestServer(t)
+	controller := newOnDemandController(server)
+
+	payload := []byte(`{
+		"action":"queued",
+		"organization":{"login":"test-org"},
+		"workflow_job":{
+			"id":103,
+			"workflow_name":"CI",
+			"name":"Unit Tests / Node 22",
+			"labels":["self-hosted","fireactions","fire-1x1"]
+		}
+	}`)
+	request := newSignedWebhookRequest(t, server.config.GitHub.WebhookSecret, payload)
+	recorder := httptest.NewRecorder()
+
+	controller.HandleGitHubWebhook(recorder, request)
+
+	require.Equal(t, http.StatusAccepted, recorder.Code)
+	assert.Equal(t, 1, poolA.GetDesiredReplicas())
+
+	metadata := poolA.nextDemandRunnerMetadata()
+	assert.Equal(t, "CI", metadata.WorkflowName)
+	assert.Equal(t, "Unit Tests / Node 22", metadata.JobName)
+	assert.Equal(t, "fire-1x1-ci-unit-tests-node-22-103", metadata.Prefix)
+}
+
 func TestOnDemandWebhookRejectsInvalidSignature(t *testing.T) {
 	server, poolA, _ := newOnDemandTestServer(t)
 	controller := newOnDemandController(server)

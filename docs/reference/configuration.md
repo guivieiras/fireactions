@@ -51,6 +51,15 @@ metrics:
   #
   address: 127.0.0.1:8081
 
+  #
+  # Optional Prometheus file_sd target generation for node_exporter processes
+  # running inside active VMs.
+  #
+  vm_node_exporter:
+    enabled: false
+    port: 9100
+    targets_dir: /var/lib/fireactions/prometheus-targets
+
 #
 # GitHub configuration.
 #

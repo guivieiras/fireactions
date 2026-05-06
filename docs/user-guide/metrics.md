@@ -4,6 +4,8 @@ Fireactions provides Prometheus metrics for monitoring.
 
 The metrics can be enabled by setting the `metrics.enabled` configuration option to `true`. The metrics are exposed on the `/metrics` endpoint on the address and port specified in the `metrics.address` and `metrics.port` configuration options.
 
+Fireactions can also maintain Prometheus `file_sd` target files for node_exporter processes running inside active VMs. Enable `metrics.vm_node_exporter`, point `targets_dir` at a directory scraped by Prometheus, and run node_exporter inside the guest image on the configured port.
+
 ## Metrics
 
 The following metrics are available, excluding the default Prometheus metrics:

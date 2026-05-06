@@ -23,8 +23,10 @@ func TestConfigValidateCapacityDefaults(t *testing.T) {
 
 	require.NoError(t, config.Validate())
 	require.NotNil(t, config.Capacity)
+	require.NotNil(t, config.Metrics.VMNodeExporter)
 	assert.Equal(t, int64(0), config.Capacity.MemoryLimitMib)
 	assert.Equal(t, int64(0), config.Capacity.VCPULimit)
+	assert.Equal(t, 9100, config.Metrics.VMNodeExporter.Port)
 }
 
 func TestConfigValidateRejectsNegativeCapacity(t *testing.T) {
@@ -91,6 +93,26 @@ func TestConfigValidateOnDemandRequiresPoolNameLabel(t *testing.T) {
 	err := config.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "runner.labels must include the pool name")
+}
+
+func TestConfigValidateVMNodeExporterRequiresTargetsDir(t *testing.T) {
+	config := minimalValidConfig()
+	config.Metrics.VMNodeExporter.Enabled = true
+
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "metrics.vm_node_exporter.targets_dir")
+}
+
+func TestConfigValidateVMNodeExporterDefaultsPort(t *testing.T) {
+	config := minimalValidConfig()
+	config.Metrics.VMNodeExporter = &VMNodeExporterConfig{
+		Enabled:    true,
+		TargetsDir: "/var/lib/fireactions/prometheus-targets",
+	}
+
+	require.NoError(t, config.Validate())
+	assert.Equal(t, 9100, config.Metrics.VMNodeExporter.Port)
 }
 
 func minimalValidConfig() *Config {

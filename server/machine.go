@@ -25,6 +25,8 @@ type Machine struct {
 	CreatedAt    time.Time
 	MemoryMib    int64
 	VCPUCount    int64
+	WorkflowName string
+	JobName      string
 	Reservation  *CapacityReservation
 
 	vsockCID      uint32

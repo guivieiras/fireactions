@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,7 +21,13 @@ const (
 type jobDemandEntry struct {
 	organization string
 	poolName     string
+	runner       demandRunnerMetadata
 	lastSeenAt   time.Time
+}
+
+type poolDemandEntry struct {
+	count   int
+	runners []demandRunnerMetadata
 }
 
 type onDemandController struct {
@@ -176,6 +183,12 @@ func (c *onDemandController) processWorkflowJobEvent(event *githubv63.WorkflowJo
 		c.upsertJob(jobID, &jobDemandEntry{
 			organization: organization,
 			poolName:     poolName,
+			runner: demandRunnerMetadataFromWorkflowJob(
+				poolName,
+				jobID,
+				event.WorkflowJob.GetWorkflowName(),
+				event.WorkflowJob.GetName(),
+			),
 		})
 	case "completed":
 		c.removeJob(jobID)
@@ -237,6 +250,12 @@ func (c *onDemandController) reconcileOnce(ctx context.Context) error {
 						reconciledJobs[job.GetID()] = &jobDemandEntry{
 							organization: organization,
 							poolName:     poolName,
+							runner: demandRunnerMetadataFromWorkflowJob(
+								poolName,
+								job.GetID(),
+								job.GetWorkflowName(),
+								job.GetName(),
+							),
 						}
 					}
 				}
@@ -327,13 +346,27 @@ func (c *onDemandController) pruneCompletedJobsLocked(now time.Time) {
 	}
 }
 
-func (c *onDemandController) poolDemandLocked() map[string]int {
-	poolDemand := make(map[string]int)
-	for _, job := range c.jobs {
+func (c *onDemandController) poolDemandLocked() map[string]poolDemandEntry {
+	poolDemand := make(map[string]poolDemandEntry)
+	jobIDs := make([]int64, 0, len(c.jobs))
+	for jobID := range c.jobs {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sort.Slice(jobIDs, func(i, j int) bool {
+		return jobIDs[i] < jobIDs[j]
+	})
+
+	for _, jobID := range jobIDs {
+		job := c.jobs[jobID]
 		if job == nil {
 			continue
 		}
-		poolDemand[job.poolName]++
+		demand := poolDemand[job.poolName]
+		demand.count++
+		if job.runner.Prefix != "" {
+			demand.runners = append(demand.runners, job.runner)
+		}
+		poolDemand[job.poolName] = demand
 	}
 
 	return poolDemand
@@ -347,11 +380,11 @@ func (c *onDemandController) now() time.Time {
 	return c.nowFn().UTC()
 }
 
-func (c *onDemandController) applyPoolDemand(poolDemand map[string]int) {
+func (c *onDemandController) applyPoolDemand(poolDemand map[string]poolDemandEntry) {
 	for _, pool := range c.server.snapshotPools() {
 		demand := poolDemand[pool.config.Name]
-		pool.SetDemandReplicas(demand)
-		metricOnDemandJobsActive.WithLabelValues(pool.config.Name, pool.config.Runner.Organization).Set(float64(demand))
+		pool.SetDemandReplicasWithRunnerMetadata(demand.count, demand.runners)
+		metricOnDemandJobsActive.WithLabelValues(pool.config.Name, pool.config.Runner.Organization).Set(float64(demand.count))
 	}
 }
 

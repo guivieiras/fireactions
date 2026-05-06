@@ -37,8 +37,15 @@ type ContainerdConfig struct {
 }
 
 type MetricsConfig struct {
-	Enabled bool   `yaml:"enabled" validate:""`
-	Address string `yaml:"address" validate:"required_if=enabled true,hostname_port"`
+	Enabled        bool                  `yaml:"enabled" validate:""`
+	Address        string                `yaml:"address" validate:"required_if=enabled true,hostname_port"`
+	VMNodeExporter *VMNodeExporterConfig `yaml:"vm_node_exporter"`
+}
+
+type VMNodeExporterConfig struct {
+	Enabled    bool   `yaml:"enabled" validate:""`
+	Port       int    `yaml:"port"`
+	TargetsDir string `yaml:"targets_dir"`
 }
 
 type GitHubConfig struct {
@@ -79,7 +86,7 @@ func DefaultConfig() *Config {
 		OnDemand:         false,
 		Capacity:         &CapacityConfig{},
 		Containerd:       &ContainerdConfig{Address: "/run/containerd/containerd.sock", Namespace: "fireactions"},
-		Metrics:          &MetricsConfig{Enabled: true, Address: ":8081"},
+		Metrics:          &MetricsConfig{Enabled: true, Address: ":8081", VMNodeExporter: &VMNodeExporterConfig{Port: 9100}},
 		BasicAuthEnabled: false,
 		BasicAuthUsers:   map[string]string{},
 		GitHub:           &GitHubConfig{AppPrivateKey: "", AppID: 0},
@@ -130,6 +137,12 @@ func (c *Config) Validate() error {
 	if c.Metrics == nil {
 		c.Metrics = &MetricsConfig{}
 	}
+	if c.Metrics.VMNodeExporter == nil {
+		c.Metrics.VMNodeExporter = &VMNodeExporterConfig{Port: 9100}
+	}
+	if c.Metrics.VMNodeExporter.Port == 0 {
+		c.Metrics.VMNodeExporter.Port = 9100
+	}
 
 	if err := validator.New().Struct(c); err != nil {
 		return err
@@ -142,6 +155,13 @@ func (c *Config) Validate() error {
 		if c.Metrics.Address == "" {
 			return fmt.Errorf("metrics address is required when on_demand is enabled")
 		}
+	}
+
+	if c.Metrics.VMNodeExporter.Enabled && c.Metrics.VMNodeExporter.TargetsDir == "" {
+		return fmt.Errorf("metrics.vm_node_exporter.targets_dir is required when vm_node_exporter is enabled")
+	}
+	if c.Metrics.VMNodeExporter.Port < 1 || c.Metrics.VMNodeExporter.Port > 65535 {
+		return fmt.Errorf("metrics.vm_node_exporter.port must be between 1 and 65535")
 	}
 
 	for i, pool := range c.Pools {

@@ -154,8 +154,12 @@ func (s *Server) Run(ctx context.Context) error {
 		s.logger.Info().Msg("On-demand scaling enabled")
 	}
 
+	if err := clearVMNodeExporterTargets(s.config.Metrics.VMNodeExporter); err != nil {
+		return err
+	}
+
 	for _, poolConfig := range s.config.Pools {
-		pool, err := NewPool(s.logger, poolConfig, s.github, s.imageManager, s.containerd, &s.nextCID, s.capacity)
+		pool, err := NewPool(s.logger, poolConfig, s.github, s.imageManager, s.containerd, &s.nextCID, s.capacity, s.config.Metrics.VMNodeExporter)
 		if err != nil {
 			return fmt.Errorf("creating pool: %w", err)
 		}

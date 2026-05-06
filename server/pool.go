@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,7 @@ var errBusyRunner = errors.New("runner is busy")
 // Pool represents a pool of Firecracker VMs that are used to run GitHub Actions jobs.
 type Pool struct {
 	config                *PoolConfig
+	vmNodeExporterConfig  *VMNodeExporterConfig
 	containerd            *containerd.Client
 	github                *github.Client
 	imageManager          *imageManager
@@ -59,6 +61,8 @@ type Pool struct {
 	demandReplicas        atomic.Int32
 	desiredReplicas       atomic.Int32
 	isActive              bool
+	onDemandRunnersMu     sync.Mutex
+	onDemandRunners       []demandRunnerMetadata
 	scaleTrigger          chan struct{}
 	stopCh                chan struct{}
 	doneCh                chan struct{}
@@ -98,7 +102,7 @@ func (p *PoolConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 // NewPool creates a new Pool.
-func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, imageManager *imageManager, containerdClient *containerd.Client, nextCID *atomic.Uint32, capacity *CapacityManager) (*Pool, error) {
+func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, imageManager *imageManager, containerdClient *containerd.Client, nextCID *atomic.Uint32, capacity *CapacityManager, vmNodeExporterConfig *VMNodeExporterConfig) (*Pool, error) {
 	l := logger.With().Str("pool", config.Name).Logger()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,23 +112,24 @@ func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, 
 	}
 
 	p := &Pool{
-		config:              config,
-		l:                   &sync.Mutex{},
-		machinesMu:          &sync.Mutex{},
-		machines:            make(map[string]*Machine),
-		isActive:            true,
-		containerd:          containerdClient,
-		github:              github,
-		imageManager:        imageManager,
-		capacity:            capacity,
-		logger:              &l,
-		scaleTrigger:        make(chan struct{}, 1),
-		stopCh:              make(chan struct{}, 1),
-		doneCh:              make(chan struct{}),
-		ctx:                 ctx,
-		cancel:              cancel,
-		nextCID:             nextCID,
-		shutdownWaitTimeout: 30 * time.Second,
+		config:               config,
+		vmNodeExporterConfig: vmNodeExporterConfig,
+		l:                    &sync.Mutex{},
+		machinesMu:           &sync.Mutex{},
+		machines:             make(map[string]*Machine),
+		isActive:             true,
+		containerd:           containerdClient,
+		github:               github,
+		imageManager:         imageManager,
+		capacity:             capacity,
+		logger:               &l,
+		scaleTrigger:         make(chan struct{}, 1),
+		stopCh:               make(chan struct{}, 1),
+		doneCh:               make(chan struct{}),
+		ctx:                  ctx,
+		cancel:               cancel,
+		nextCID:              nextCID,
+		shutdownWaitTimeout:  30 * time.Second,
 	}
 
 	p.baseReplicas.Store(int32(config.Replicas))
@@ -481,6 +486,16 @@ func (p *Pool) SetReplicas(replicas int) {
 
 // SetDemandReplicas updates the on-demand replica target for the pool.
 func (p *Pool) SetDemandReplicas(replicas int) {
+	p.SetDemandReplicasWithRunnerMetadata(replicas, nil)
+}
+
+// SetDemandReplicasWithRunnerMetadata updates the on-demand replica target and
+// metadata used to name new VMs created for queued workflow jobs.
+func (p *Pool) SetDemandReplicasWithRunnerMetadata(replicas int, runners []demandRunnerMetadata) {
+	p.onDemandRunnersMu.Lock()
+	p.onDemandRunners = append([]demandRunnerMetadata(nil), runners...)
+	p.onDemandRunnersMu.Unlock()
+
 	p.demandReplicas.Store(int32(replicas))
 	p.recomputeDesiredReplicas()
 }
@@ -576,7 +591,8 @@ func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservati
 		return fmt.Errorf("ensuring image: %w", err)
 	}
 
-	runnerName := fmt.Sprintf("%s-%s", p.config.Runner.Name, stringid.New())
+	demandRunner := p.nextDemandRunnerMetadata()
+	runnerName := p.runnerName(demandRunner.Prefix)
 
 	leaseCtx, leaseCtxCancel, err := p.containerd.WithLease(ctx,
 		leases.WithID(fmt.Sprintf("fireactions/pools/%s/%s", p.config.Name, runnerName)))
@@ -721,6 +737,8 @@ func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservati
 		CreatedAt:    time.Now().UTC(),
 		MemoryMib:    p.config.Firecracker.MachineConfig.MemSizeMib,
 		VCPUCount:    p.config.Firecracker.MachineConfig.VcpuCount,
+		WorkflowName: demandRunner.WorkflowName,
+		JobName:      demandRunner.JobName,
 		Reservation:  reservation,
 		vsockCID:     vsockCID,
 		vsockPath:    vsockPath,
@@ -744,11 +762,19 @@ func (p *Pool) trackMachine(machine *Machine) {
 	p.machinesMu.Unlock()
 
 	metricVMHostProcess.track(machine)
+	if err := p.writeVMNodeExporterTarget(machine); err != nil {
+		p.logger.Warn().Err(err).Str("machine", machine.Name).Msg("Failed to write VM node exporter target")
+	}
 
 	p.cleanupWg.Add(1)
 	go func() {
 		defer p.cleanupWg.Done()
 		defer metricVMHostProcess.untrack(machine)
+		defer func() {
+			if err := p.removeVMNodeExporterTarget(machine); err != nil {
+				p.logger.Warn().Err(err).Str("machine", machine.Name).Msg("Failed to remove VM node exporter target")
+			}
+		}()
 
 		waitDone := make(chan error, 1)
 		go func() {
@@ -797,6 +823,40 @@ func (p *Pool) trackMachine(machine *Machine) {
 
 		p.logger.Info().Msgf("Successfully cleaned up exited Firecracker VM %s", machine.Name)
 	}()
+}
+
+func (p *Pool) nextDemandRunnerMetadata() demandRunnerMetadata {
+	p.onDemandRunnersMu.Lock()
+	defer p.onDemandRunnersMu.Unlock()
+
+	if len(p.onDemandRunners) == 0 {
+		return demandRunnerMetadata{}
+	}
+
+	metadata := p.onDemandRunners[0]
+	copy(p.onDemandRunners, p.onDemandRunners[1:])
+	p.onDemandRunners = p.onDemandRunners[:len(p.onDemandRunners)-1]
+	return metadata
+}
+
+func (p *Pool) runnerName(prefix string) string {
+	if prefix == "" {
+		prefix = p.config.Runner.Name
+	}
+
+	suffix := stringid.New()
+	maxPrefixLen := 63 - len(suffix) - 1
+	if maxPrefixLen < 1 {
+		return suffix
+	}
+	if len(prefix) > maxPrefixLen {
+		prefix = strings.Trim(prefix[:maxPrefixLen], "-")
+	}
+	if prefix == "" {
+		prefix = p.config.Runner.Name
+	}
+
+	return fmt.Sprintf("%s-%s", prefix, suffix)
 }
 
 func putFirecrackerCPUConfig(ctx context.Context, socketPath string, cpuConfig FirecrackerCPUConfig) error {

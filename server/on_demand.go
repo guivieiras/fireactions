@@ -174,6 +174,18 @@ func (c *onDemandController) processWorkflowJobEvent(event *githubv63.WorkflowJo
 			return nil
 		}
 
+		if event.GetAction() == "in_progress" && c.workflowJobAssignedToAnotherHost(event.WorkflowJob) {
+			c.logger.Info().
+				Int64("job_id", jobID).
+				Int64("runner_id", event.WorkflowJob.GetRunnerID()).
+				Str("runner_name", event.WorkflowJob.GetRunnerName()).
+				Str("pool", poolName).
+				Str("organization", organization).
+				Msg("Dropping workflow job demand assigned to another host")
+			c.dropJob(jobID)
+			return nil
+		}
+
 		c.logger.Info().
 			Int64("job_id", jobID).
 			Str("pool", poolName).
@@ -211,6 +223,7 @@ func (c *onDemandController) reconcile(ctx context.Context) {
 
 func (c *onDemandController) reconcileOnce(ctx context.Context) error {
 	reconciledJobs := make(map[int64]*jobDemandEntry)
+	assignedElsewhere := make(map[int64]struct{})
 
 	for organization, installationID := range c.installationIDs {
 		repositories, err := c.listRepositoriesFn(ctx, installationID)
@@ -247,6 +260,11 @@ func (c *onDemandController) reconcileOnce(ctx context.Context) error {
 							continue
 						}
 
+						if job.GetStatus() == "in_progress" && c.workflowJobAssignedToAnotherHost(job) {
+							assignedElsewhere[job.GetID()] = struct{}{}
+							continue
+						}
+
 						reconciledJobs[job.GetID()] = &jobDemandEntry{
 							organization: organization,
 							poolName:     poolName,
@@ -263,7 +281,7 @@ func (c *onDemandController) reconcileOnce(ctx context.Context) error {
 		}
 	}
 
-	c.mergeReconciledJobs(reconciledJobs, c.now())
+	c.mergeReconciledJobs(reconciledJobs, assignedElsewhere, c.now())
 	return nil
 }
 
@@ -301,12 +319,24 @@ func (c *onDemandController) removeJob(jobID int64) {
 	c.applyPoolDemand(poolDemand)
 }
 
-func (c *onDemandController) mergeReconciledJobs(jobs map[int64]*jobDemandEntry, now time.Time) {
+func (c *onDemandController) dropJob(jobID int64) {
+	c.mu.Lock()
+	delete(c.jobs, jobID)
+	poolDemand := c.poolDemandLocked()
+	c.mu.Unlock()
+
+	c.applyPoolDemand(poolDemand)
+}
+
+func (c *onDemandController) mergeReconciledJobs(jobs map[int64]*jobDemandEntry, assignedElsewhere map[int64]struct{}, now time.Time) {
 	c.mu.Lock()
 	c.pruneCompletedJobsLocked(now)
 
 	mergedJobs := make(map[int64]*jobDemandEntry, len(c.jobs)+len(jobs))
 	for jobID, existing := range c.jobs {
+		if _, ok := assignedElsewhere[jobID]; ok {
+			continue
+		}
 		if existing == nil {
 			continue
 		}
@@ -319,6 +349,9 @@ func (c *onDemandController) mergeReconciledJobs(jobs map[int64]*jobDemandEntry,
 	}
 
 	for jobID, job := range jobs {
+		if _, ok := assignedElsewhere[jobID]; ok {
+			continue
+		}
 		if job == nil {
 			continue
 		}
@@ -336,6 +369,20 @@ func (c *onDemandController) mergeReconciledJobs(jobs map[int64]*jobDemandEntry,
 	c.mu.Unlock()
 
 	c.applyPoolDemand(poolDemand)
+}
+
+func (c *onDemandController) workflowJobAssignedToAnotherHost(job *githubv63.WorkflowJob) bool {
+	if job == nil {
+		return false
+	}
+
+	runnerID := job.GetRunnerID()
+	runnerName := job.GetRunnerName()
+	if runnerID == 0 && runnerName == "" {
+		return false
+	}
+
+	return !c.server.ownsRunner(runnerID, runnerName)
 }
 
 func (c *onDemandController) pruneCompletedJobsLocked(now time.Time) {

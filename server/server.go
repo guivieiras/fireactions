@@ -269,3 +269,22 @@ func (s *Server) findMachine(id string) (*Machine, error) {
 
 	return nil, fmt.Errorf("machine not found: %s", id)
 }
+
+func (s *Server) ownsRunner(runnerID int64, runnerName string) bool {
+	for _, pool := range s.snapshotPools() {
+		pool.machinesMu.Lock()
+		for _, machine := range pool.machines {
+			if runnerID != 0 && machine.RunnerID == runnerID {
+				pool.machinesMu.Unlock()
+				return true
+			}
+			if runnerName != "" && machine.Name == runnerName {
+				pool.machinesMu.Unlock()
+				return true
+			}
+		}
+		pool.machinesMu.Unlock()
+	}
+
+	return false
+}

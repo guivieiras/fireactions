@@ -251,6 +251,129 @@ func TestOnDemandCompletedWebhookBeatsStaleReconcileResult(t *testing.T) {
 	assert.Equal(t, 0, poolA.GetDesiredReplicas())
 }
 
+func TestOnDemandReconcileDropsJobAssignedToAnotherHost(t *testing.T) {
+	server, poolA, _ := newOnDemandTestServer(t)
+	controller := newOnDemandController(server)
+	controller.installationIDs["test-org"] = 1
+
+	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
+	controller.nowFn = func() time.Time { return now }
+	controller.listRepositoriesFn = func(ctx context.Context, installationID int64) ([]*githubv63.Repository, error) {
+		return []*githubv63.Repository{{
+			Name: githubv63.String("repo"),
+			Owner: &githubv63.User{
+				Login: githubv63.String("test-org"),
+			},
+		}}, nil
+	}
+	controller.listWorkflowRunsFn = func(ctx context.Context, installationID int64, owner, repo, status string) ([]*githubv63.WorkflowRun, error) {
+		if status != "in_progress" {
+			return nil, nil
+		}
+
+		return []*githubv63.WorkflowRun{{
+			ID: githubv63.Int64(88),
+		}}, nil
+	}
+	controller.listWorkflowJobsFn = func(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]*githubv63.WorkflowJob, error) {
+		return []*githubv63.WorkflowJob{{
+			ID:         githubv63.Int64(401),
+			Status:     githubv63.String("in_progress"),
+			Labels:     []string{"self-hosted", "fireactions", "fire-1x1"},
+			RunnerID:   githubv63.Int64(999),
+			RunnerName: githubv63.String("other-host-runner"),
+		}}, nil
+	}
+
+	err := controller.processWorkflowJobEvent(&githubv63.WorkflowJobEvent{
+		Action: githubv63.String("queued"),
+		Org:    &githubv63.Organization{Login: githubv63.String("test-org")},
+		WorkflowJob: &githubv63.WorkflowJob{
+			ID:     githubv63.Int64(401),
+			Labels: []string{"self-hosted", "fireactions", "fire-1x1"},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, poolA.GetDesiredReplicas())
+
+	now = now.Add(time.Second)
+	require.NoError(t, controller.reconcileOnce(context.Background()))
+	assert.Equal(t, 0, poolA.GetDesiredReplicas())
+}
+
+func TestOnDemandReconcileKeepsJobAssignedToLocalRunner(t *testing.T) {
+	server, poolA, _ := newOnDemandTestServer(t)
+	controller := newOnDemandController(server)
+	controller.installationIDs["test-org"] = 1
+
+	poolA.machinesMu.Lock()
+	poolA.machines["local-runner"] = &Machine{
+		Name:     "local-runner",
+		RunnerID: 777,
+		Pool:     poolA.config.Name,
+	}
+	poolA.machinesMu.Unlock()
+
+	controller.listRepositoriesFn = func(ctx context.Context, installationID int64) ([]*githubv63.Repository, error) {
+		return []*githubv63.Repository{{
+			Name: githubv63.String("repo"),
+			Owner: &githubv63.User{
+				Login: githubv63.String("test-org"),
+			},
+		}}, nil
+	}
+	controller.listWorkflowRunsFn = func(ctx context.Context, installationID int64, owner, repo, status string) ([]*githubv63.WorkflowRun, error) {
+		if status != "in_progress" {
+			return nil, nil
+		}
+
+		return []*githubv63.WorkflowRun{{
+			ID: githubv63.Int64(89),
+		}}, nil
+	}
+	controller.listWorkflowJobsFn = func(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]*githubv63.WorkflowJob, error) {
+		return []*githubv63.WorkflowJob{{
+			ID:         githubv63.Int64(402),
+			Status:     githubv63.String("in_progress"),
+			Labels:     []string{"self-hosted", "fireactions", "fire-1x1"},
+			RunnerID:   githubv63.Int64(777),
+			RunnerName: githubv63.String("local-runner"),
+		}}, nil
+	}
+
+	require.NoError(t, controller.reconcileOnce(context.Background()))
+	assert.Equal(t, 1, poolA.GetDesiredReplicas())
+}
+
+func TestOnDemandWebhookDropsJobAssignedToAnotherHost(t *testing.T) {
+	server, poolA, _ := newOnDemandTestServer(t)
+	controller := newOnDemandController(server)
+
+	err := controller.processWorkflowJobEvent(&githubv63.WorkflowJobEvent{
+		Action: githubv63.String("queued"),
+		Org:    &githubv63.Organization{Login: githubv63.String("test-org")},
+		WorkflowJob: &githubv63.WorkflowJob{
+			ID:     githubv63.Int64(403),
+			Labels: []string{"self-hosted", "fireactions", "fire-1x1"},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, poolA.GetDesiredReplicas())
+
+	err = controller.processWorkflowJobEvent(&githubv63.WorkflowJobEvent{
+		Action: githubv63.String("in_progress"),
+		Org:    &githubv63.Organization{Login: githubv63.String("test-org")},
+		WorkflowJob: &githubv63.WorkflowJob{
+			ID:         githubv63.Int64(403),
+			Labels:     []string{"self-hosted", "fireactions", "fire-1x1"},
+			RunnerID:   githubv63.Int64(999),
+			RunnerName: githubv63.String("other-host-runner"),
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, poolA.GetDesiredReplicas())
+}
+
 func newOnDemandTestServer(t *testing.T) (*Server, *Pool, *Pool) {
 	t.Helper()
 

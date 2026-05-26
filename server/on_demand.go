@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	onDemandReconcileInterval  = 60 * time.Second
-	onDemandMissingJobGrace    = 2 * onDemandReconcileInterval
+	onDemandReconcileInterval  = 15 * time.Second
+	onDemandMissingJobGrace    = 30 * time.Second
 	onDemandCompletedJobWindow = 2 * onDemandReconcileInterval
 )
 
@@ -260,8 +260,33 @@ func (c *onDemandController) reconcileOnce(ctx context.Context) error {
 							continue
 						}
 
-						if job.GetStatus() == "in_progress" && c.workflowJobAssignedToAnotherHost(job) {
-							assignedElsewhere[job.GetID()] = struct{}{}
+						ownership := "queued"
+						decision := "keep"
+						if job.GetStatus() == "in_progress" {
+							ownership = c.workflowJobRunnerOwnership(job)
+							if ownership == "other" {
+								decision = "drop"
+								assignedElsewhere[job.GetID()] = struct{}{}
+							}
+						}
+
+						c.logger.Info().
+							Int64("run_id", run.GetID()).
+							Int64("job_id", job.GetID()).
+							Int64("runner_id", job.GetRunnerID()).
+							Str("runner_name", job.GetRunnerName()).
+							Str("repository", owner+"/"+name).
+							Str("organization", organization).
+							Str("pool", poolName).
+							Str("status", job.GetStatus()).
+							Str("runner_ownership", ownership).
+							Str("decision", decision).
+							Str("workflow_name", job.GetWorkflowName()).
+							Str("job_name", job.GetName()).
+							Strs("labels", job.Labels).
+							Msg("Reconciled workflow job demand")
+
+						if decision == "drop" {
 							continue
 						}
 
@@ -334,14 +359,41 @@ func (c *onDemandController) mergeReconciledJobs(jobs map[int64]*jobDemandEntry,
 
 	mergedJobs := make(map[int64]*jobDemandEntry, len(c.jobs)+len(jobs))
 	for jobID, existing := range c.jobs {
-		if _, ok := assignedElsewhere[jobID]; ok {
-			continue
-		}
 		if existing == nil {
 			continue
 		}
-		if now.Sub(existing.lastSeenAt) > onDemandMissingJobGrace {
+		if _, ok := assignedElsewhere[jobID]; ok {
+			c.logger.Info().
+				Int64("job_id", jobID).
+				Str("organization", existing.organization).
+				Str("pool", existing.poolName).
+				Str("workflow_name", existing.runner.WorkflowName).
+				Str("job_name", existing.runner.JobName).
+				Msg("Dropping cached workflow job demand assigned to another host")
 			continue
+		}
+		missingFor := now.Sub(existing.lastSeenAt)
+		if missingFor > onDemandMissingJobGrace {
+			c.logger.Info().
+				Int64("job_id", jobID).
+				Dur("missing_for", missingFor).
+				Str("organization", existing.organization).
+				Str("pool", existing.poolName).
+				Str("workflow_name", existing.runner.WorkflowName).
+				Str("job_name", existing.runner.JobName).
+				Msg("Expiring missing workflow job demand")
+			continue
+		}
+		if _, ok := jobs[jobID]; !ok {
+			c.logger.Info().
+				Int64("job_id", jobID).
+				Dur("missing_for", missingFor).
+				Dur("missing_grace", onDemandMissingJobGrace).
+				Str("organization", existing.organization).
+				Str("pool", existing.poolName).
+				Str("workflow_name", existing.runner.WorkflowName).
+				Str("job_name", existing.runner.JobName).
+				Msg("Preserving missing workflow job demand")
 		}
 
 		entryCopy := *existing
@@ -372,17 +424,25 @@ func (c *onDemandController) mergeReconciledJobs(jobs map[int64]*jobDemandEntry,
 }
 
 func (c *onDemandController) workflowJobAssignedToAnotherHost(job *githubv63.WorkflowJob) bool {
+	return c.workflowJobRunnerOwnership(job) == "other"
+}
+
+func (c *onDemandController) workflowJobRunnerOwnership(job *githubv63.WorkflowJob) string {
 	if job == nil {
-		return false
+		return "unassigned"
 	}
 
 	runnerID := job.GetRunnerID()
 	runnerName := job.GetRunnerName()
 	if runnerID == 0 && runnerName == "" {
-		return false
+		return "unassigned"
 	}
 
-	return !c.server.ownsRunner(runnerID, runnerName)
+	if c.server.ownsRunner(runnerID, runnerName) {
+		return "local"
+	}
+
+	return "other"
 }
 
 func (c *onDemandController) pruneCompletedJobsLocked(now time.Time) {

@@ -149,7 +149,7 @@ func TestOnDemandReconcileRebuildsPoolDemand(t *testing.T) {
 	assert.Equal(t, 1, poolB.GetDesiredReplicas())
 }
 
-func TestOnDemandReconcilePreservesWebhookTrackedJobAcrossTransientPollMiss(t *testing.T) {
+func TestOnDemandReconcilePreservesWebhookTrackedJobWithinMissingGrace(t *testing.T) {
 	server, poolA, _ := newOnDemandTestServer(t)
 	controller := newOnDemandController(server)
 	controller.installationIDs["test-org"] = 1
@@ -182,11 +182,11 @@ func TestOnDemandReconcilePreservesWebhookTrackedJobAcrossTransientPollMiss(t *t
 	require.NoError(t, err)
 	assert.Equal(t, 1, poolA.GetDesiredReplicas())
 
-	now = now.Add(onDemandReconcileInterval)
+	now = now.Add(onDemandMissingJobGrace - time.Second)
 	require.NoError(t, controller.reconcileOnce(context.Background()))
 	assert.Equal(t, 1, poolA.GetDesiredReplicas())
 
-	now = now.Add(onDemandMissingJobGrace + time.Second)
+	now = now.Add(2 * time.Second)
 	require.NoError(t, controller.reconcileOnce(context.Background()))
 	assert.Equal(t, 0, poolA.GetDesiredReplicas())
 }

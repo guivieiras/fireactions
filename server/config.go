@@ -64,12 +64,13 @@ type RunnerConfig struct {
 }
 
 type FirecrackerConfig struct {
-	BinaryPath      string                   `yaml:"binary_path" `
-	KernelImagePath string                   `yaml:"kernel_image_path"`
-	KernelArgs      string                   `yaml:"kernel_args"`
-	CPUConfig       FirecrackerCPUConfig     `yaml:"cpu_config"`
-	MachineConfig   FirecrackerMachineConfig `yaml:"machine_config"`
-	Metadata        map[string]interface{}   `yaml:"metadata"`
+	BinaryPath        string                   `yaml:"binary_path" `
+	KernelImagePath   string                   `yaml:"kernel_image_path"`
+	KernelArgs        string                   `yaml:"kernel_args"`
+	RootFSInitialSize string                   `yaml:"rootfs_initial_size"`
+	CPUConfig         FirecrackerCPUConfig     `yaml:"cpu_config"`
+	MachineConfig     FirecrackerMachineConfig `yaml:"machine_config"`
+	Metadata          map[string]interface{}   `yaml:"metadata"`
 }
 
 type FirecrackerCPUConfig map[string]interface{}

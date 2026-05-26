@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -618,6 +619,9 @@ func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservati
 	if err != nil {
 		return fmt.Errorf("containerd: creating snapshot: %w", err)
 	}
+	if err := p.resizeRootFSInitialSize(ctx, snapshotMounts[0].Source, runnerName); err != nil {
+		return fmt.Errorf("rootfs initial resize: %w", err)
+	}
 
 	machineLogFile, err := os.Create(filepath.Join(p.GetDir(), fmt.Sprintf("%s.log", runnerName)))
 	if err != nil {
@@ -1030,6 +1034,41 @@ func (p *Pool) createSnapshot(ctx context.Context, image containerd.Image, snaps
 	}
 
 	return mounts, nil
+}
+
+func (p *Pool) resizeRootFSInitialSize(ctx context.Context, rootDevice, runnerName string) error {
+	targetSize := strings.TrimSpace(p.config.Firecracker.RootFSInitialSize)
+	if targetSize == "" {
+		return nil
+	}
+
+	for _, args := range [][]string{
+		{"e2fsck", "-fy", rootDevice},
+		{"resize2fs", rootDevice, targetSize},
+		{"e2fsck", "-fy", rootDevice},
+	} {
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			exitErr, ok := err.(*exec.ExitError)
+			if args[0] == "e2fsck" && ok && exitErr.ExitCode() == 1 {
+				p.logger.Info().
+					Str("runner", runnerName).
+					Str("command", strings.Join(args, " ")).
+					Msg("e2fsck corrected Firecracker rootfs before resize")
+				continue
+			}
+			return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		}
+	}
+
+	p.logger.Info().
+		Str("runner", runnerName).
+		Str("root_device", rootDevice).
+		Str("rootfs_initial_size", targetSize).
+		Msg("Resized Firecracker rootfs before boot")
+
+	return nil
 }
 
 // removeGitHubRunner removes a runner from GitHub Actions.

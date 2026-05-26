@@ -68,6 +68,7 @@ type FirecrackerConfig struct {
 	KernelImagePath   string                   `yaml:"kernel_image_path"`
 	KernelArgs        string                   `yaml:"kernel_args"`
 	RootFSInitialSize string                   `yaml:"rootfs_initial_size"`
+	RootFSMaxSize     string                   `yaml:"rootfs_max_size"`
 	CPUConfig         FirecrackerCPUConfig     `yaml:"cpu_config"`
 	MachineConfig     FirecrackerMachineConfig `yaml:"machine_config"`
 	Metadata          map[string]interface{}   `yaml:"metadata"`

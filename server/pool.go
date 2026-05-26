@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	units "github.com/docker/go-units"
 	"github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	"github.com/hostinger/fireactions/helper/deepcopy"
@@ -619,8 +621,8 @@ func (p *Pool) createMachine(ctx context.Context, reservation *CapacityReservati
 	if err != nil {
 		return fmt.Errorf("containerd: creating snapshot: %w", err)
 	}
-	if err := p.resizeRootFSInitialSize(ctx, snapshotMounts[0].Source, runnerName); err != nil {
-		return fmt.Errorf("rootfs initial resize: %w", err)
+	if err := p.prepareRootFSSize(ctx, snapshotMounts[0].Source, runnerName); err != nil {
+		return fmt.Errorf("rootfs sizing: %w", err)
 	}
 
 	machineLogFile, err := os.Create(filepath.Join(p.GetDir(), fmt.Sprintf("%s.log", runnerName)))
@@ -1036,12 +1038,76 @@ func (p *Pool) createSnapshot(ctx context.Context, image containerd.Image, snaps
 	return mounts, nil
 }
 
-func (p *Pool) resizeRootFSInitialSize(ctx context.Context, rootDevice, runnerName string) error {
-	targetSize := strings.TrimSpace(p.config.Firecracker.RootFSInitialSize)
-	if targetSize == "" {
+func (p *Pool) prepareRootFSSize(ctx context.Context, rootDevice, runnerName string) error {
+	initialSize := strings.TrimSpace(p.config.Firecracker.RootFSInitialSize)
+	maxSize := strings.TrimSpace(p.config.Firecracker.RootFSMaxSize)
+	if initialSize == "" && maxSize == "" {
 		return nil
 	}
 
+	currentSizeBytes, err := blockDeviceSize(ctx, rootDevice)
+	if err != nil {
+		return err
+	}
+
+	if initialSize != "" {
+		initialSizeBytes, err := parseRootFSSize(initialSize)
+		if err != nil {
+			return fmt.Errorf("rootfs_initial_size: %w", err)
+		}
+		switch {
+		case currentSizeBytes > initialSizeBytes:
+			return fmt.Errorf("root device %s is %s, larger than rootfs_initial_size %s; lower containerd base_image_size instead of shrinking at boot", rootDevice, units.HumanSize(float64(currentSizeBytes)), initialSize)
+		case currentSizeBytes < initialSizeBytes:
+			if err := resizeRootBlockDevice(ctx, rootDevice, initialSizeBytes); err != nil {
+				return fmt.Errorf("grow root block device to initial size: %w", err)
+			}
+			if err := p.resizeExt4RootFS(ctx, rootDevice, runnerName, initialSize); err != nil {
+				return fmt.Errorf("grow root filesystem to initial size: %w", err)
+			}
+			p.logger.Info().
+				Str("runner", runnerName).
+				Str("root_device", rootDevice).
+				Str("rootfs_initial_size", initialSize).
+				Msg("Grew Firecracker rootfs to configured initial size before boot")
+
+			currentSizeBytes, err = blockDeviceSize(ctx, rootDevice)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if maxSize == "" {
+		return nil
+	}
+
+	maxSizeBytes, err := parseRootFSSize(maxSize)
+	if err != nil {
+		return fmt.Errorf("rootfs_max_size: %w", err)
+	}
+	if currentSizeBytes > maxSizeBytes {
+		return fmt.Errorf("root device %s is %s, larger than rootfs_max_size %s", rootDevice, units.HumanSize(float64(currentSizeBytes)), maxSize)
+	}
+	if currentSizeBytes == maxSizeBytes {
+		return nil
+	}
+
+	if err := resizeRootBlockDevice(ctx, rootDevice, maxSizeBytes); err != nil {
+		return fmt.Errorf("grow root block device to max size: %w", err)
+	}
+
+	p.logger.Info().
+		Str("runner", runnerName).
+		Str("root_device", rootDevice).
+		Str("rootfs_initial_size", initialSize).
+		Str("rootfs_max_size", maxSize).
+		Msg("Expanded Firecracker root block device ceiling before boot")
+
+	return nil
+}
+
+func (p *Pool) resizeExt4RootFS(ctx context.Context, rootDevice, runnerName, targetSize string) error {
 	for _, args := range [][]string{
 		{"e2fsck", "-fy", rootDevice},
 		{"resize2fs", rootDevice, targetSize},
@@ -1055,20 +1121,116 @@ func (p *Pool) resizeRootFSInitialSize(ctx context.Context, rootDevice, runnerNa
 				p.logger.Info().
 					Str("runner", runnerName).
 					Str("command", strings.Join(args, " ")).
-					Msg("e2fsck corrected Firecracker rootfs before resize")
+					Msg("e2fsck corrected Firecracker rootfs before grow")
 				continue
 			}
 			return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 		}
 	}
 
-	p.logger.Info().
-		Str("runner", runnerName).
-		Str("root_device", rootDevice).
-		Str("rootfs_initial_size", targetSize).
-		Msg("Resized Firecracker rootfs before boot")
+	return nil
+}
+
+func parseRootFSSize(raw string) (uint64, error) {
+	sizeBytes, err := units.RAMInBytes(raw)
+	if err != nil {
+		return 0, err
+	}
+	if sizeBytes <= 0 {
+		return 0, fmt.Errorf("size must be positive")
+	}
+	if sizeBytes%512 != 0 {
+		return 0, fmt.Errorf("size must align to 512-byte sectors")
+	}
+	return uint64(sizeBytes), nil
+}
+
+func blockDeviceSize(ctx context.Context, device string) (uint64, error) {
+	output, err := exec.CommandContext(ctx, "blockdev", "--getsize64", device).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("blockdev --getsize64 %s: %w: %s", device, err, strings.TrimSpace(string(output)))
+	}
+	size, err := strconv.ParseUint(strings.TrimSpace(string(output)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse blockdev size for %s: %w", device, err)
+	}
+	return size, nil
+}
+
+func resizeRootBlockDevice(ctx context.Context, rootDevice string, targetSizeBytes uint64) error {
+	deviceName, err := devmapperDeviceName(rootDevice)
+	if err != nil {
+		return err
+	}
+
+	output, err := exec.CommandContext(ctx, "dmsetup", "table", deviceName).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dmsetup table %s: %w: %s", deviceName, err, strings.TrimSpace(string(output)))
+	}
+
+	targetTable, err := growDevmapperThinTable(strings.TrimSpace(string(output)), targetSizeBytes)
+	if err != nil {
+		return err
+	}
+
+	if targetTable == "" {
+		return nil
+	}
+
+	if output, err := exec.CommandContext(ctx, "dmsetup", "suspend", deviceName).CombinedOutput(); err != nil {
+		return fmt.Errorf("dmsetup suspend %s: %w: %s", deviceName, err, strings.TrimSpace(string(output)))
+	}
+
+	reloadOutput, reloadErr := exec.CommandContext(ctx, "dmsetup", "reload", deviceName, "--table", targetTable).CombinedOutput()
+	resumeOutput, resumeErr := exec.CommandContext(ctx, "dmsetup", "resume", deviceName).CombinedOutput()
+	if reloadErr != nil {
+		return fmt.Errorf("dmsetup reload %s: %w: %s", deviceName, reloadErr, strings.TrimSpace(string(reloadOutput)))
+	}
+	if resumeErr != nil {
+		return fmt.Errorf("dmsetup resume %s: %w: %s", deviceName, resumeErr, strings.TrimSpace(string(resumeOutput)))
+	}
 
 	return nil
+}
+
+func devmapperDeviceName(device string) (string, error) {
+	const mapperPrefix = "/dev/mapper/"
+	if !strings.HasPrefix(device, mapperPrefix) {
+		return "", fmt.Errorf("expected devmapper root device under %s, got %s", mapperPrefix, device)
+	}
+
+	name := strings.TrimPrefix(device, mapperPrefix)
+	if name == "" || strings.ContainsRune(name, '/') {
+		return "", fmt.Errorf("invalid devmapper root device: %s", device)
+	}
+
+	return name, nil
+}
+
+func growDevmapperThinTable(table string, targetSizeBytes uint64) (string, error) {
+	fields := strings.Fields(table)
+	if len(fields) < 5 {
+		return "", fmt.Errorf("unexpected devmapper table: %q", table)
+	}
+	if fields[0] != "0" || fields[2] != "thin" {
+		return "", fmt.Errorf("expected a single thin target table, got: %q", table)
+	}
+
+	currentSectors, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("parse devmapper table size: %w", err)
+	}
+	targetSectors := targetSizeBytes / 512
+
+	if currentSectors > targetSectors {
+		return "", fmt.Errorf("devmapper device is already larger than target: current=%d sectors target=%d sectors", currentSectors, targetSectors)
+	}
+	if currentSectors == targetSectors {
+		return "", nil
+	}
+
+	fields[1] = strconv.FormatUint(targetSectors, 10)
+	return strings.Join(fields, " "), nil
 }
 
 // removeGitHubRunner removes a runner from GitHub Actions.

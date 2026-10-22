@@ -6,8 +6,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,88 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestOnDemandRepositoryCacheRefreshesWithoutCachingFailures(t *testing.T) {
+	server, _, _ := newOnDemandTestServer(t)
+	controller := newOnDemandController(server)
+	now := time.Date(2026, 10, 7, 4, 0, 0, 0, time.UTC)
+	controller.nowFn = func() time.Time { return now }
+	calls := 0
+	fail := false
+	controller.listRepositoriesFn = func(context.Context, int64) ([]*githubv63.Repository, error) {
+		calls++
+		if fail {
+			return nil, errors.New("temporary failure")
+		}
+		return []*githubv63.Repository{{ID: githubv63.Int64(int64(calls))}}, nil
+	}
+
+	first, err := controller.cachedRepositories(context.Background(), 1)
+	require.NoError(t, err)
+	now = now.Add(onDemandRepositoryCacheTTL - time.Second)
+	cached, err := controller.cachedRepositories(context.Background(), 1)
+	require.NoError(t, err)
+	assert.Equal(t, first, cached)
+	assert.Equal(t, 1, calls)
+
+	_, err = controller.cachedRepositories(context.Background(), 2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls, "installations must have separate caches")
+
+	now = now.Add(time.Second)
+	fail = true
+	_, err = controller.cachedRepositories(context.Background(), 1)
+	require.Error(t, err)
+	fail = false
+	refreshed, err := controller.cachedRepositories(context.Background(), 1)
+	require.NoError(t, err)
+	assert.Equal(t, 4, calls)
+	assert.NotEqual(t, first, refreshed)
+}
+
+func TestOnDemandQuotaDelayPreservesDemandAndWebhooks(t *testing.T) {
+	server, pool, _ := newOnDemandTestServer(t)
+	controller := newOnDemandController(server)
+	controller.installationIDs["test-org"] = 1
+	now := time.Date(2026, 10, 7, 4, 0, 0, 0, time.UTC)
+	controller.nowFn = func() time.Time { return now }
+	resetAt := now.Add(10 * time.Minute)
+	controller.listRepositoriesFn = func(context.Context, int64) ([]*githubv63.Repository, error) {
+		return []*githubv63.Repository{{
+			Name:  githubv63.String("repo"),
+			Owner: &githubv63.User{Login: githubv63.String("test-org")},
+		}}, nil
+	}
+	controller.listWorkflowRunsFn = func(context.Context, int64, string, string, string) ([]*githubv63.WorkflowRun, error) {
+		return nil, &githubv63.RateLimitError{
+			Rate: githubv63.Rate{Reset: githubv63.Timestamp{Time: resetAt}},
+			Response: &http.Response{StatusCode: http.StatusForbidden, Request: &http.Request{
+				Method: http.MethodGet, URL: &url.URL{Scheme: "https", Host: "api.github.com"},
+			}},
+		}
+	}
+	event := &githubv63.WorkflowJobEvent{
+		Action:      githubv63.String("queued"),
+		Org:         &githubv63.Organization{Login: githubv63.String("test-org")},
+		WorkflowJob: &githubv63.WorkflowJob{ID: githubv63.Int64(101), Labels: []string{"fire-1x1"}},
+	}
+	require.NoError(t, controller.processWorkflowJobEvent(event))
+	assert.Equal(t, 1, pool.GetDesiredReplicas())
+
+	delay := controller.reconcile(context.Background())
+	assert.Equal(t, resetAt.Sub(now)+time.Second, delay)
+	assert.Equal(t, 1, pool.GetDesiredReplicas(), "quota failures must not discard queued demand")
+
+	event.Action = githubv63.String("completed")
+	require.NoError(t, controller.processWorkflowJobEvent(event))
+	assert.Equal(t, 0, pool.GetDesiredReplicas(), "webhooks must still update demand during the pause")
+
+	now = resetAt.Add(time.Second)
+	controller.listWorkflowRunsFn = func(context.Context, int64, string, string, string) ([]*githubv63.WorkflowRun, error) {
+		return nil, nil
+	}
+	assert.Equal(t, controller.pollInterval, controller.reconcile(context.Background()))
+}
 
 func TestOnDemandWebhookScalesMatchingPool(t *testing.T) {
 	server, poolA, _ := newOnDemandTestServer(t)

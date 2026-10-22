@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -13,10 +14,16 @@ import (
 )
 
 const (
-	onDemandReconcileInterval  = 15 * time.Second
-	onDemandMissingJobGrace    = 30 * time.Second
+	onDemandReconcileInterval  = 2 * time.Minute
+	onDemandRepositoryCacheTTL = 15 * time.Minute
+	onDemandMissingJobGrace    = 2 * onDemandReconcileInterval
 	onDemandCompletedJobWindow = 2 * onDemandReconcileInterval
 )
+
+type repositoryCacheEntry struct {
+	repositories []*githubv63.Repository
+	expiresAt    time.Time
+}
 
 type jobDemandEntry struct {
 	organization string
@@ -40,6 +47,7 @@ type onDemandController struct {
 	jobs            map[int64]*jobDemandEntry
 	completedJobs   map[int64]time.Time
 	installationIDs map[string]int64
+	repositoryCache map[int64]repositoryCacheEntry
 	nowFn           func() time.Time
 
 	listRepositoriesFn func(context.Context, int64) ([]*githubv63.Repository, error)
@@ -57,6 +65,7 @@ func newOnDemandController(server *Server) *onDemandController {
 		jobs:            make(map[int64]*jobDemandEntry),
 		completedJobs:   make(map[int64]time.Time),
 		installationIDs: make(map[string]int64),
+		repositoryCache: make(map[int64]repositoryCacheEntry),
 		nowFn:           time.Now,
 	}
 	controller.listRepositoriesFn = controller.listRepositories
@@ -87,17 +96,15 @@ func (c *onDemandController) Initialize(ctx context.Context) error {
 
 func (c *onDemandController) Run(ctx context.Context) {
 	go func() {
-		c.reconcile(ctx)
-
-		ticker := time.NewTicker(c.pollInterval)
-		defer ticker.Stop()
-
 		for {
+			delay := c.reconcile(ctx)
+			// Wait after the scan finishes so slow scans cannot trigger back-to-back polling.
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
-				c.reconcile(ctx)
+			case <-timer.C:
 			}
 		}
 	}()
@@ -211,14 +218,22 @@ func (c *onDemandController) processWorkflowJobEvent(event *githubv63.WorkflowJo
 	return nil
 }
 
-func (c *onDemandController) reconcile(ctx context.Context) {
+func (c *onDemandController) reconcile(ctx context.Context) time.Duration {
 	if err := c.reconcileOnce(ctx); err != nil {
 		metricOnDemandReconciliations.WithLabelValues("error").Inc()
+		var rateLimit *githubv63.RateLimitError
+		if errors.As(err, &rateLimit) {
+			delay := max(c.pollInterval, rateLimit.Rate.Reset.Sub(c.now())+time.Second)
+			c.logger.Warn().Err(err).Dur("retry_after", delay).
+				Msg("GitHub API quota exhausted; delaying on-demand reconciliation")
+			return delay
+		}
 		c.logger.Error().Err(err).Msg("On-demand reconciliation failed")
-		return
+		return c.pollInterval
 	}
 
 	metricOnDemandReconciliations.WithLabelValues("success").Inc()
+	return c.pollInterval
 }
 
 func (c *onDemandController) reconcileOnce(ctx context.Context) error {
@@ -226,7 +241,7 @@ func (c *onDemandController) reconcileOnce(ctx context.Context) error {
 	assignedElsewhere := make(map[int64]struct{})
 
 	for organization, installationID := range c.installationIDs {
-		repositories, err := c.listRepositoriesFn(ctx, installationID)
+		repositories, err := c.cachedRepositories(ctx, installationID)
 		if err != nil {
 			return fmt.Errorf("listing repositories for organization %q: %w", organization, err)
 		}
@@ -527,6 +542,22 @@ func (c *onDemandController) matchPool(organization string, labels []string) (st
 	}
 
 	return "", "ambiguous"
+}
+
+func (c *onDemandController) cachedRepositories(ctx context.Context, installationID int64) ([]*githubv63.Repository, error) {
+	if entry, ok := c.repositoryCache[installationID]; ok && c.now().Before(entry.expiresAt) {
+		return entry.repositories, nil
+	}
+
+	repositories, err := c.listRepositoriesFn(ctx, installationID)
+	if err != nil {
+		return nil, err
+	}
+	c.repositoryCache[installationID] = repositoryCacheEntry{
+		repositories: repositories,
+		expiresAt:    c.now().Add(onDemandRepositoryCacheTTL),
+	}
+	return repositories, nil
 }
 
 func (c *onDemandController) listRepositories(ctx context.Context, installationID int64) ([]*githubv63.Repository, error) {

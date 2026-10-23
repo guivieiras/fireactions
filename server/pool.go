@@ -352,6 +352,9 @@ func (p *Pool) scaleUp(ctx context.Context, count, desiredReplicas, curSize, pen
 
 			start := time.Now()
 			if err := p.runCreateMachine(ctx, reservation); err != nil {
+				// A failed create never owns a machine, so give the capacity back.
+				// Release is idempotent, so creates that already released are fine.
+				reservation.Release()
 				metricScaleOperations.WithLabelValues(p.config.Name, p.config.Runner.Organization, "up", "failure").Inc()
 				p.logger.Error().Err(err).Msg("Failed to create machine")
 				return

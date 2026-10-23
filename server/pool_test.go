@@ -176,6 +176,27 @@ func TestPoolCreateFailureReleasesCapacity(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestPoolCreateFailureBeforeCleanupReleasesCapacity(t *testing.T) {
+	capacity := NewCapacityManager(&CapacityConfig{
+		MemoryLimitMib: 2048,
+		VCPULimit:      2,
+	})
+	pool := newTestPool(t, "pool-early-failure", 2048, 2, capacity)
+
+	// Like createMachine failing in ensureImage: it returns before it takes
+	// ownership of the reservation.
+	pool.createMachineFn = func(ctx context.Context, reservation *CapacityReservation) error {
+		return errors.New("ensuring image: not found")
+	}
+
+	require.NoError(t, pool.Scale(context.Background(), 1))
+
+	require.Eventually(t, func() bool {
+		snapshot := capacity.Snapshot()
+		return snapshot.MemoryReservedMib == 0 && snapshot.VCPUReserved == 0 && snapshot.Outstanding == 0
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestPoolDeleteMachineKeepsReservationOnStopFailure(t *testing.T) {
 	capacity := NewCapacityManager(&CapacityConfig{
 		MemoryLimitMib: 2048,

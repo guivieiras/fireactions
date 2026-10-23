@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -94,6 +95,69 @@ func TestPoolScaleUpHonorsSharedCapacity(t *testing.T) {
 		snapshot := capacity.Snapshot()
 		return snapshot.MemoryReservedMib == 0 && snapshot.VCPUReserved == 0 && snapshot.Outstanding == 0
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestPoolScaleUpLetsALargePoolInAheadOfASmallOne(t *testing.T) {
+	capacity := NewCapacityManager(&CapacityConfig{
+		MemoryLimitMib: 4096,
+		VCPULimit:      8,
+	})
+	small := newTestPool(t, "pool-small", 1024, 1, capacity)
+	large := newTestPool(t, "pool-large", 2048, 1, capacity)
+
+	var runtimesMu sync.Mutex
+	var smallRuntimes []*fakeMachineRuntime
+	attach := func(pool *Pool, prefix string) {
+		var created atomic.Int32
+		pool.createMachineFn = func(ctx context.Context, reservation *CapacityReservation) error {
+			runtime := newFakeMachineRuntime()
+			if pool == small {
+				runtimesMu.Lock()
+				smallRuntimes = append(smallRuntimes, runtime)
+				runtimesMu.Unlock()
+			}
+			pool.trackMachine(&Machine{
+				Name:        fmt.Sprintf("%s-%d", prefix, created.Add(1)),
+				Pool:        pool.config.Name,
+				CreatedAt:   time.Now().UTC(),
+				MemoryMib:   pool.config.Firecracker.MachineConfig.MemSizeMib,
+				VCPUCount:   pool.config.Firecracker.MachineConfig.VcpuCount,
+				Reservation: reservation,
+				waitFunc:    runtime.wait,
+				stopFunc:    runtime.stop,
+			})
+			return nil
+		}
+	}
+	attach(small, "small")
+	attach(large, "large")
+
+	// The small pool fills the host, then the large pool asks and waits.
+	require.NoError(t, small.Scale(context.Background(), 4))
+	require.Eventually(t, func() bool { return small.GetCurrentSize() == 4 }, time.Second, 10*time.Millisecond)
+	require.NoError(t, large.Scale(context.Background(), 1))
+	assert.Equal(t, CapacityBlockReasonMemory, large.capacityBlockedReason)
+
+	stopSmall := func(i int) {
+		runtimesMu.Lock()
+		runtime := smallRuntimes[i]
+		runtimesMu.Unlock()
+		runtime.stop()
+		require.Eventually(t, func() bool { return small.GetCurrentSize() == 3-i }, time.Second, 10*time.Millisecond)
+	}
+
+	// Small VMs finish one by one. The small pool still wants 4, but the freed
+	// memory is held until the large VM fits.
+	stopSmall(0)
+	require.NoError(t, small.Scale(context.Background(), 4))
+	assert.Equal(t, CapacityBlockReasonWaiting, small.capacityBlockedReason)
+	stopSmall(1)
+	require.NoError(t, small.Scale(context.Background(), 4))
+	assert.Equal(t, 2, small.GetCurrentSize()+int(small.pendingCreates.Load()))
+
+	require.NoError(t, large.Scale(context.Background(), 1))
+	require.Eventually(t, func() bool { return large.GetCurrentSize() == 1 }, time.Second, 10*time.Millisecond)
+	assert.Equal(t, CapacityBlockReasonNone, large.capacityBlockedReason)
 }
 
 func TestPoolScaleUpBlocksWithoutIncrementingPendingCreatesForDeniedVMs(t *testing.T) {

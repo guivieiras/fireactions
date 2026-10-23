@@ -292,6 +292,7 @@ func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
 	delta := desiredReplicas - effectiveSize
 
 	if delta == 0 {
+		p.capacity.Forget(p.config.Name)
 		p.clearCapacityBlocked(false)
 		return nil
 	}
@@ -301,6 +302,7 @@ func (p *Pool) Scale(ctx context.Context, desiredReplicas int) error {
 			ctx, delta, desiredReplicas, curSize, pendingCreates, pendingDeletes)
 		p.updateCapacityBlockedState(result, desiredReplicas, curSize)
 	} else {
+		p.capacity.Forget(p.config.Name)
 		p.clearCapacityBlocked(false)
 		p.scaleDown(
 			ctx, -delta, desiredReplicas, curSize, pendingCreates, pendingDeletes)
@@ -321,7 +323,7 @@ func (p *Pool) scaleUp(ctx context.Context, count, desiredReplicas, curSize, pen
 
 	memPerVM := p.config.Firecracker.MachineConfig.MemSizeMib
 	vcpuPerVM := p.config.Firecracker.MachineConfig.VcpuCount
-	reservations, reason := p.capacity.ReserveUpTo(count, memPerVM, vcpuPerVM)
+	reservations, reason := p.capacity.ReserveFor(p.config.Name, count, memPerVM, vcpuPerVM)
 	blocked := count - len(reservations)
 
 	if blocked > 0 {
@@ -334,6 +336,8 @@ func (p *Pool) scaleUp(ctx context.Context, count, desiredReplicas, curSize, pen
 		case CapacityBlockReasonBoth:
 			metricCapacityAdmissionBlocks.WithLabelValues(p.config.Name, p.config.Runner.Organization, "memory").Add(float64(blocked))
 			metricCapacityAdmissionBlocks.WithLabelValues(p.config.Name, p.config.Runner.Organization, "vcpu").Add(float64(blocked))
+		case CapacityBlockReasonWaiting:
+			metricCapacityAdmissionBlocks.WithLabelValues(p.config.Name, p.config.Runner.Organization, "waiting").Add(float64(blocked))
 		}
 	}
 

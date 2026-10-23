@@ -92,7 +92,7 @@ var (
 	metricCapacityAdmissionBlocks = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name:      "capacity_admission_blocks_total",
 		Namespace: namespace,
-		Help:      "Number of VM admissions blocked by global capacity limits.",
+		Help:      "Number of VM admissions blocked by global capacity limits, or held for a pool that has waited longer (resource=waiting).",
 	}, []string{"pool", "organization", "resource"})
 
 	metricOnDemandJobsActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
